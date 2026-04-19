@@ -30,7 +30,8 @@ build: $(COREDNS_SRC)
 	cd $(COREDNS_SRC) && CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o $(CURDIR)/$(BINARY) .
 	@echo
 	@echo "=== plugins ==="
-	@$(CURDIR)/$(BINARY) -plugins | grep -qw '$(PLUGIN_NAME)' && echo "proxmox plugin present in binary" || (echo "ERROR: proxmox plugin NOT in binary" && exit 1)
+	@# Verify via strings (works for cross-compiled binaries, unlike running -plugins)
+	@strings $(CURDIR)/$(BINARY) | grep -qw '$(PLUGIN_MODULE)' && echo "proxmox plugin linked into binary" || (echo "ERROR: proxmox plugin NOT in binary" && exit 1)
 
 # Smoke test: start the binary against a dummy Corefile; check it parses + loads
 # the plugin (initial PVE refresh will fail — that's expected and must not crash

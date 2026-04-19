@@ -1,0 +1,71 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goarch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+          check-latest: true
+
+      - name: build custom coredns (${{ matrix.goarch }})
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          make build
+          mv coredns coredns-linux-${{ matrix.goarch }}
+          sha256sum coredns-linux-${{ matrix.goarch }} > coredns-linux-${{ matrix.goarch }}.sha256
+
+      - name: verify plugin present (amd64 only — can't exec arm64 binary on amd64 runner)
+        if: matrix.goarch == 'amd64'
+        run: ./coredns-linux-amd64 -plugins | grep -qw proxmox
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: coredns-linux-${{ matrix.goarch }}
+          path: |
+            coredns-linux-${{ matrix.goarch }}
+            coredns-linux-${{ matrix.goarch }}.sha256
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+
+      - name: flatten artifacts
+        run: |
+          mkdir -p release
+          find artifacts -type f -exec mv {} release/ \;
+          ls -la release/
+
+      - name: create github release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          gh release create "$tag" \
+            --title "$tag" \
+            --generate-notes \
+            release/coredns-linux-amd64 \
+            release/coredns-linux-amd64.sha256 \
+            release/coredns-linux-arm64 \
+            release/coredns-linux-arm64.sha256

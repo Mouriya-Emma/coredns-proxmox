@@ -40,6 +40,40 @@ func TestFilterAllowed_LAN24Keeps19216810_24Only(t *testing.T) {
 	}
 }
 
+func TestFilterAllowed_ExcludeIPsDropsListedIPs(t *testing.T) {
+	p := &Proxmox{
+		AllowCIDRs: []netip.Prefix{mustPrefix("192.168.1.0/24")},
+		ExcludeIPs: []netip.Addr{
+			netip.MustParseAddr("192.168.1.22"), // dns CT (static-claimed)
+			netip.MustParseAddr("192.168.1.67"), // pve (static-claimed)
+			netip.MustParseAddr("192.168.1.23"), // pve SR-IOV VF (not management)
+			netip.MustParseAddr("192.168.1.68"), // pve debug PF (not management)
+		},
+	}
+	in := []net.IP{
+		net.ParseIP("192.168.1.22"), // exclude
+		net.ParseIP("192.168.1.41"), // keep (app01)
+		net.ParseIP("192.168.1.67"), // exclude
+		net.ParseIP("192.168.1.68"), // exclude
+	}
+	got := p.filterAllowed(in)
+	want := []net.IP{net.ParseIP("192.168.1.41")}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("want %v, got %v", want, got)
+	}
+}
+
+func TestFilterAllowed_ExcludeIPsStandalone(t *testing.T) {
+	// Without allow_cidr, exclude_ip still works on its own.
+	p := &Proxmox{ExcludeIPs: []netip.Addr{netip.MustParseAddr("10.0.0.5")}}
+	in := []net.IP{net.ParseIP("10.0.0.5"), net.ParseIP("10.0.0.6")}
+	got := p.filterAllowed(in)
+	want := []net.IP{net.ParseIP("10.0.0.6")}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("want %v, got %v", want, got)
+	}
+}
+
 func TestAppendParsed_ParsesAndSkipsJunk(t *testing.T) {
 	cases := []struct {
 		in   string

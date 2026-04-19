@@ -155,7 +155,7 @@ func appendParsed(ips []net.IP, raw string) []net.IP {
 }
 
 func (p *Proxmox) filterAllowed(ips []net.IP) []net.IP {
-	if len(p.AllowCIDRs) == 0 {
+	if len(p.AllowCIDRs) == 0 && len(p.ExcludeIPs) == 0 {
 		return ips
 	}
 	var keep []net.IP
@@ -165,14 +165,36 @@ func (p *Proxmox) filterAllowed(ips []net.IP) []net.IP {
 			continue
 		}
 		a = a.Unmap()
-		for _, cidr := range p.AllowCIDRs {
-			if cidr.Contains(a) {
-				keep = append(keep, ip)
-				break
-			}
+		if p.isExcluded(a) {
+			continue
 		}
+		if !p.isAllowed(a) {
+			continue
+		}
+		keep = append(keep, ip)
 	}
 	return keep
+}
+
+func (p *Proxmox) isAllowed(a netip.Addr) bool {
+	if len(p.AllowCIDRs) == 0 {
+		return true
+	}
+	for _, cidr := range p.AllowCIDRs {
+		if cidr.Contains(a) {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *Proxmox) isExcluded(a netip.Addr) bool {
+	for _, ex := range p.ExcludeIPs {
+		if ex == a {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *Proxmox) addRecords(out recordSet, name string, ips []net.IP) {

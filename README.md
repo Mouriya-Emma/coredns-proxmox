@@ -21,6 +21,7 @@ hb.lan:5300 {
         token_id coredns-proxmox
         token_secret_file /etc/coredns/pve-token
         allow_cidr 192.168.1.0/24
+        exclude_ip 192.168.1.22 192.168.1.67
         refresh 60s
         ttl 60
         fallthrough
@@ -43,7 +44,8 @@ Directive reference:
 | `token_id` | yes | API token ID (the part after `!`) |
 | `token_secret` | one of | the raw token secret (keep secrets out of Corefile) |
 | `token_secret_file` | one of | path to a file containing the secret |
-| `allow_cidr` | no | repeatable; if any given, only IPs in one of these CIDRs are returned |
+| `allow_cidr` | no | one or more CIDRs; if any given, only IPs in one of these CIDRs are returned. Repeatable; multiple values on one line allowed |
+| `exclude_ip` | no | drop these specific IPs from every emitted record. Use for IPs already claimed by a static source (e.g. authoritative host file, hypervisor secondary NICs). Repeatable; multiple values on one line allowed |
 | `insecure_skip_verify` | no | accept self-signed PVE certs |
 | `refresh` | no | inventory refresh interval (default `60s`) |
 | `ttl` | no | A/AAAA record TTL (default `60`) |

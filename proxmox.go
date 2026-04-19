@@ -41,8 +41,13 @@ type Proxmox struct {
 	// Refresh interval for the PVE inventory loop.
 	Refresh time.Duration
 
-	// AllowCIDRs, if non-empty, filters out IPs not in one of these prefixes.
+	// AllowCIDRs, if non-empty, keeps only IPs in one of these prefixes.
 	AllowCIDRs []netip.Prefix
+
+	// ExcludeIPs drops these specific IPs from every emitted record. Matches
+	// the scanner's IP_SKIP semantics — used to hide IPs already claimed by
+	// an authoritative source (static hosts file, other PVE NICs).
+	ExcludeIPs []netip.Addr
 
 	// Fallthrough hands off to the next plugin on no-match.
 	Fallthrough bool

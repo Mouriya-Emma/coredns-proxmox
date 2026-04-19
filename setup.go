@@ -47,6 +47,7 @@ func parse(c *caddy.Controller) (*Proxmox, error) {
 		tokenSecret     string
 		tokenSecretFile string
 		allowCIDRs      []netip.Prefix
+		excludeIPs      []netip.Addr
 		refresh         = 60 * time.Second
 		ttl             = uint32(60)
 		fall            = false
@@ -89,14 +90,29 @@ func parse(c *caddy.Controller) (*Proxmox, error) {
 				}
 				tokenSecretFile = c.Val()
 			case "allow_cidr":
-				if !c.NextArg() {
+				args := c.RemainingArgs()
+				if len(args) == 0 {
 					return nil, c.ArgErr()
 				}
-				prefix, err := netip.ParsePrefix(c.Val())
-				if err != nil {
-					return nil, c.Errf("invalid allow_cidr %q: %v", c.Val(), err)
+				for _, s := range args {
+					prefix, err := netip.ParsePrefix(s)
+					if err != nil {
+						return nil, c.Errf("invalid allow_cidr %q: %v", s, err)
+					}
+					allowCIDRs = append(allowCIDRs, prefix)
 				}
-				allowCIDRs = append(allowCIDRs, prefix)
+			case "exclude_ip":
+				args := c.RemainingArgs()
+				if len(args) == 0 {
+					return nil, c.ArgErr()
+				}
+				for _, s := range args {
+					addr, err := netip.ParseAddr(s)
+					if err != nil {
+						return nil, c.Errf("invalid exclude_ip %q: %v", s, err)
+					}
+					excludeIPs = append(excludeIPs, addr.Unmap())
+				}
 			case "refresh":
 				if !c.NextArg() {
 					return nil, c.ArgErr()
@@ -165,6 +181,7 @@ func parse(c *caddy.Controller) (*Proxmox, error) {
 		TTL:         ttl,
 		Refresh:     refresh,
 		AllowCIDRs:  allowCIDRs,
+		ExcludeIPs:  excludeIPs,
 		Fallthrough: fall,
 		client:      client,
 	}, nil

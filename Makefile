@@ -25,7 +25,10 @@ build: $(COREDNS_SRC)
 	@grep -q '^$(PLUGIN_NAME):' $(COREDNS_SRC)/plugin.cfg || \
 	  sed -i '/^hosts:/i $(PLUGIN_NAME):$(PLUGIN_MODULE)' $(COREDNS_SRC)/plugin.cfg
 	cd $(COREDNS_SRC) && go mod edit -replace $(PLUGIN_MODULE)=$(CURDIR)
-	cd $(COREDNS_SRC) && go generate
+	# go generate must run host-arch: its generator programs are compiled &
+	# executed, not just compiled. When the outer env sets GOARCH=arm64 for
+	# cross-compile, generators get cross-built and then fail to exec here.
+	cd $(COREDNS_SRC) && GOOS= GOARCH= go generate
 	cd $(COREDNS_SRC) && go mod tidy
 	cd $(COREDNS_SRC) && CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o $(CURDIR)/$(BINARY) .
 	@echo

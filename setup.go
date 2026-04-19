@@ -1,0 +1,187 @@
+package proxmox
+
+import (
+	"crypto/tls"
+	"fmt"
+	"net/http"
+	"net/netip"
+	"net/url"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/coredns/caddy"
+	"github.com/coredns/coredns/core/dnsserver"
+	"github.com/coredns/coredns/plugin"
+
+	"github.com/Mouriya-Emma/coredns-proxmox/internal/pveapi"
+)
+
+func init() {
+	plugin.Register("proxmox", setup)
+}
+
+func setup(c *caddy.Controller) error {
+	p, err := parse(c)
+	if err != nil {
+		return plugin.Error("proxmox", err)
+	}
+
+	c.OnStartup(p.Start)
+	c.OnShutdown(p.Stop)
+
+	dnsserver.GetConfig(c).AddPlugin(func(next plugin.Handler) plugin.Handler {
+		p.Next = next
+		return p
+	})
+	return nil
+}
+
+func parse(c *caddy.Controller) (*Proxmox, error) {
+	var (
+		endpoint        string
+		insecure        bool
+		user            string
+		tokenID         string
+		tokenSecret     string
+		tokenSecretFile string
+		allowCIDRs      []netip.Prefix
+		refresh         = 60 * time.Second
+		ttl             = uint32(60)
+		fall            = false
+	)
+
+	zones := normaliseZones(c.ServerBlockKeys)
+
+	for c.Next() {
+		// proxmox directive accepts no positional args; config is all block subdirectives
+		if args := c.RemainingArgs(); len(args) > 0 {
+			return nil, c.Errf("proxmox: unexpected positional args %v", args)
+		}
+		for c.NextBlock() {
+			switch c.Val() {
+			case "endpoint":
+				if !c.NextArg() {
+					return nil, c.ArgErr()
+				}
+				endpoint = c.Val()
+			case "insecure_skip_verify":
+				insecure = true
+			case "user":
+				if !c.NextArg() {
+					return nil, c.ArgErr()
+				}
+				user = c.Val()
+			case "token_id":
+				if !c.NextArg() {
+					return nil, c.ArgErr()
+				}
+				tokenID = c.Val()
+			case "token_secret":
+				if !c.NextArg() {
+					return nil, c.ArgErr()
+				}
+				tokenSecret = c.Val()
+			case "token_secret_file":
+				if !c.NextArg() {
+					return nil, c.ArgErr()
+				}
+				tokenSecretFile = c.Val()
+			case "allow_cidr":
+				if !c.NextArg() {
+					return nil, c.ArgErr()
+				}
+				prefix, err := netip.ParsePrefix(c.Val())
+				if err != nil {
+					return nil, c.Errf("invalid allow_cidr %q: %v", c.Val(), err)
+				}
+				allowCIDRs = append(allowCIDRs, prefix)
+			case "refresh":
+				if !c.NextArg() {
+					return nil, c.ArgErr()
+				}
+				d, err := time.ParseDuration(c.Val())
+				if err != nil {
+					return nil, c.Errf("invalid refresh %q: %v", c.Val(), err)
+				}
+				refresh = d
+			case "ttl":
+				if !c.NextArg() {
+					return nil, c.ArgErr()
+				}
+				n, err := strconv.ParseUint(c.Val(), 10, 32)
+				if err != nil {
+					return nil, c.Errf("invalid ttl %q: %v", c.Val(), err)
+				}
+				ttl = uint32(n)
+			case "fallthrough":
+				fall = true
+			default:
+				return nil, c.Errf("unknown directive %q", c.Val())
+			}
+		}
+	}
+
+	if tokenSecretFile != "" {
+		data, err := os.ReadFile(tokenSecretFile)
+		if err != nil {
+			return nil, fmt.Errorf("reading token_secret_file %q: %w", tokenSecretFile, err)
+		}
+		tokenSecret = strings.TrimSpace(string(data))
+	}
+	if endpoint == "" {
+		return nil, fmt.Errorf("endpoint required")
+	}
+	if _, err := url.Parse(endpoint); err != nil {
+		return nil, fmt.Errorf("invalid endpoint %q: %w", endpoint, err)
+	}
+	if user == "" {
+		return nil, fmt.Errorf("user required")
+	}
+	if tokenID == "" {
+		return nil, fmt.Errorf("token_id required")
+	}
+	if tokenSecret == "" {
+		return nil, fmt.Errorf("token_secret or token_secret_file required")
+	}
+
+	httpc := &http.Client{Timeout: 30 * time.Second}
+	if insecure {
+		httpc.Transport = &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // opt-in for self-signed PVE certs
+		}
+	}
+
+	auth := &pveapi.APITokenAuthProvider{
+		User:    user,
+		TokenID: tokenID,
+		Secret:  tokenSecret,
+	}
+	client := pveapi.NewClient(httpc, strings.TrimRight(endpoint, "/"), auth)
+
+	return &Proxmox{
+		Zones:       zones,
+		TTL:         ttl,
+		Refresh:     refresh,
+		AllowCIDRs:  allowCIDRs,
+		Fallthrough: fall,
+		client:      client,
+	}, nil
+}
+
+func normaliseZones(raw []string) []string {
+	out := make([]string, 0, len(raw))
+	for _, z := range raw {
+		// ServerBlockKeys look like "hb.lan:5300" — drop port, trailing dot.
+		if i := strings.LastIndex(z, ":"); i >= 0 {
+			z = z[:i]
+		}
+		z = strings.TrimSuffix(strings.ToLower(z), ".")
+		if z == "" {
+			continue
+		}
+		out = append(out, z)
+	}
+	return out
+}

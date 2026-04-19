@@ -1,0 +1,13 @@
+hb.lan:15553 {
+    proxmox {
+        endpoint https://127.0.0.1:8006
+        user root@pam
+        token_id nonexistent-smoke-test
+        token_secret dummy
+        allow_cidr 192.168.1.0/24
+        refresh 60s
+        ttl 30
+        fallthrough
+    }
+    errors
+}

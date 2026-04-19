@@ -1,0 +1,15 @@
+coredns-proxmox
+Copyright 2026 Mouriya-Emma
+
+Licensed under the Apache License, Version 2.0.
+
+This product includes software developed by Andrew Dunham
+(https://github.com/andrew-d/proxmox-service-discovery), licensed under the
+Apache License, Version 2.0. Specifically, internal/pveapi/{api.go,auth.go,types.go}
+are derived from that project's internal/pveapi package, with the following
+modifications:
+
+  - auth.go: trimmed to only the API-token AuthProvider; password-auth and
+    disk-cache-key plumbing removed.
+
+See LICENSE for the full license text.

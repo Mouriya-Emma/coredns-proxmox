@@ -1,0 +1,4 @@
+.build/
+coredns
+*.out
+*.test

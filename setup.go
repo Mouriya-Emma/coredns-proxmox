@@ -188,15 +188,24 @@ func parse(c *caddy.Controller) (*Proxmox, error) {
 }
 
 func normaliseZones(raw []string) []string {
+	// Server-block keys can look like "dns://hb.lan.:5300", "hb.lan:5300",
+	// "tls://hb.lan", etc. plugin.Zones.Matches expects DNS-canonical form
+	// (lowercase, trailing dot), which is also what we key the record map by
+	// and what client qnames carry. Strip protocol prefix + :port.
 	out := make([]string, 0, len(raw))
 	for _, z := range raw {
-		// ServerBlockKeys look like "hb.lan:5300" — drop port, trailing dot.
+		if i := strings.Index(z, "://"); i >= 0 {
+			z = z[i+3:]
+		}
 		if i := strings.LastIndex(z, ":"); i >= 0 {
 			z = z[:i]
 		}
-		z = strings.TrimSuffix(strings.ToLower(z), ".")
+		z = strings.ToLower(strings.TrimSpace(z))
 		if z == "" {
 			continue
+		}
+		if !strings.HasSuffix(z, ".") {
+			z += "."
 		}
 		out = append(out, z)
 	}

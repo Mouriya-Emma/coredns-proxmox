@@ -207,6 +207,7 @@ func (p *Proxmox) addRecords(out recordSet, name string, ips []net.IP) {
 	if i := strings.Index(name, "."); i >= 0 {
 		name = name[:i]
 	}
+	// Zones carry trailing dots ("hb.lan."), so `name + "." + zone` → "app01.hb.lan.".
 	for _, zone := range p.Zones {
 		fqdn := name + "." + zone
 		out[fqdn] = append(out[fqdn], ips...)

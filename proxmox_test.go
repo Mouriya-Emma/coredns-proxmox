@@ -102,32 +102,38 @@ func TestAppendParsed_ParsesAndSkipsJunk(t *testing.T) {
 }
 
 func TestAddRecords_EmitsFQDNPerZone(t *testing.T) {
-	p := &Proxmox{Zones: []string{"hb.lan", "internal.hb.lan"}}
+	p := &Proxmox{Zones: []string{"hb.lan.", "internal.hb.lan."}}
 	rs := make(recordSet)
 	p.addRecords(rs, "App01", []net.IP{net.ParseIP("192.168.1.41")})
 
-	got := rs["app01.hb.lan"]
+	got := rs["app01.hb.lan."]
 	if len(got) != 1 || got[0].String() != "192.168.1.41" {
-		t.Errorf("hb.lan: want one entry 192.168.1.41, got %v", got)
+		t.Errorf("hb.lan.: want one entry 192.168.1.41, got %v", got)
 	}
-	got = rs["app01.internal.hb.lan"]
+	got = rs["app01.internal.hb.lan."]
 	if len(got) != 1 {
-		t.Errorf("internal.hb.lan: want one entry, got %v", got)
+		t.Errorf("internal.hb.lan.: want one entry, got %v", got)
 	}
 }
 
 func TestAddRecords_StripsDotsInHostname(t *testing.T) {
-	p := &Proxmox{Zones: []string{"hb.lan"}}
+	p := &Proxmox{Zones: []string{"hb.lan."}}
 	rs := make(recordSet)
 	p.addRecords(rs, "dns.hb.lan", []net.IP{net.ParseIP("192.168.1.22")})
-	if _, ok := rs["dns.hb.lan"]; !ok {
-		t.Errorf("expected key dns.hb.lan, got %v", rs)
+	if _, ok := rs["dns.hb.lan."]; !ok {
+		t.Errorf("expected key dns.hb.lan., got %v", rs)
 	}
 }
 
-func TestNormaliseZones_StripsPortAndCase(t *testing.T) {
-	got := normaliseZones([]string{"HB.lan:5300", "other.Lan.:53", ""})
-	want := []string{"hb.lan", "other.lan"}
+func TestNormaliseZones_StripsProtocolPortAddsDotLowercases(t *testing.T) {
+	got := normaliseZones([]string{
+		"dns://HB.lan.:5300",
+		"other.Lan.:53",
+		"tls://tls-zone:853",
+		"plain",
+		"",
+	})
+	want := []string{"hb.lan.", "other.lan.", "tls-zone.", "plain."}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("want %v, got %v", want, got)
 	}

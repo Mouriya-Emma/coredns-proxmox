@@ -68,15 +68,24 @@ Override CoreDNS version: `make build COREDNS_VERSION=1.14.1`.
 
 ## PVE API token
 
-Minimal privilege token (homelab assumed single-node):
+Minimum privileges (verified live: removing any one fails the corresponding endpoint):
+
+| privilege | endpoint(s) that require it |
+| --- | --- |
+| `Sys.Audit` | `/nodes` |
+| `VM.Audit`  | `/nodes/<n>/qemu`, `/nodes/<n>/lxc`, `/nodes/<n>/lxc/<id>/interfaces` |
+| `VM.Monitor` | `/nodes/<n>/qemu/<id>/agent/network-get-interfaces` (qemu-agent commands) |
+
+Setup:
 
 ```
-pveum user token add root@pam coredns-proxmox --privsep 1
-pveum role add DNSDiscovery --privs "VM.Audit,Sys.Audit"
+pveum role add DNSDiscovery --privs "Sys.Audit,VM.Audit,VM.Monitor"
+pveum user token add root@pam coredns-proxmox --privsep 1   # prints the secret
 pveum acl modify / --roles DNSDiscovery --tokens 'root@pam!coredns-proxmox' --propagate 1
 ```
 
-Then write the secret into the file referenced by `token_secret_file`.
+Capture the secret printed by `token add` and write it (only) to the file
+referenced by `token_secret_file`, mode `0600` owned by the coredns user.
 
 ## Licensing & attribution
 

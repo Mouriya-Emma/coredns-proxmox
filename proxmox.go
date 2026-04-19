@@ -67,8 +67,7 @@ func (p *Proxmox) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg
 	state := request.Request{W: w, Req: r}
 	qname := strings.ToLower(state.Name())
 
-	zone := plugin.Zones(p.Zones).Matches(strings.TrimSuffix(qname, "."))
-	if zone == "" {
+	if plugin.Zones(p.Zones).Matches(qname) == "" {
 		return plugin.NextOrFailure(p.Name(), p.Next, ctx, w, r)
 	}
 
@@ -77,8 +76,7 @@ func (p *Proxmox) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg
 		return p.miss(ctx, w, r)
 	}
 
-	key := strings.TrimSuffix(qname, ".")
-	ips, ok := (*records)[key]
+	ips, ok := (*records)[qname]
 	if !ok || len(ips) == 0 {
 		return p.miss(ctx, w, r)
 	}

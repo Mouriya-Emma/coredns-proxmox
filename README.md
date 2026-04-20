@@ -50,7 +50,7 @@ Directive reference:
 | `token_secret_file` | one of | path to a file containing the secret |
 | `allow_cidr` | no | one or more CIDRs; if any given, only IPs in one of these CIDRs are returned. Repeatable; multiple values on one line allowed |
 | `exclude_ip` | no | drop these specific IPs from every emitted record. Use for IPs already claimed by a static source (e.g. authoritative host file, hypervisor secondary NICs). Repeatable; multiple values on one line allowed |
-| `sriov_state` | no | path to a JSON file produced by `sriov dump` (run on the PVE host, shipped to the plugin via a bind mount). Enables the `sriov` channel — see below |
+| `sriov_state` | no | path to a JSON file describing SR-IOV VF assignments (schema below; produced externally on the PVE host, shipped to the plugin via a bind mount). Enables the `sriov` channel — see below |
 | `net0` | no | opt in to the `net0` channel — claims the interface whose hardware MAC matches the guest's declared `net0` MAC (read from `qm config` / `pct config`). Covers guests on a regular vmbr (no SR-IOV) |
 | `permissive` | no | opt in to the `permissive` channel — keeps every interface whose name isn't known-noise (`lo`, `docker*`, `br-*`, `veth*`, `cni-*`, `wt0`). Deny-list heuristic; useful fallback when no other channel covers a guest. Off by default (strict allow-list) since v0.1.5 |
 | `insecure_skip_verify` | no | accept self-signed PVE certs |
@@ -71,14 +71,14 @@ Built-in channels:
 
 | channel | enable | what it claims |
 |---|---|---|
-| `sriov` | `sriov_state <path>` | interfaces whose hardware MAC matches an SR-IOV VF adminMac recorded in `sriov dump` output for this guest |
+| `sriov` | `sriov_state <path>` | interfaces whose hardware MAC matches an SR-IOV VF adminMac recorded in the `sriov_state` dump for this guest |
 | `net0` | `net0` | interfaces whose hardware MAC matches the guest's declared `net0` MAC in `qm config` / `pct config`. Added in v0.1.6 |
 | `permissive` | `permissive` | every interface whose name isn't in a short deny-list (`lo`, `docker*`, `br-*`, `veth*`, `cni-*`, `wt0`). The legacy v0.1.4 default, now opt-in |
 
 Guest enumeration is always PVE (`GetNodes` → `GetQEMUVMs` / `GetLXCs`),
 orthogonal to channels. Guest type (VM vs CT) is orthogonal to channel
 too — each channel handles both internally if its source needs to
-(`sriov dump` already unifies `vm-direct` / `vm-via-mapping` /
+(the `sriov_state` dump already unifies `vm-direct` / `vm-via-mapping` /
 `container-phys` into `vmid → [adminMac]`; the `net0` channel dispatches
 on `gid.Type` to hit the right config endpoint).
 
@@ -92,23 +92,25 @@ never resolves anything — the Corefile should configure at least one.
 
 ## SR-IOV MAC filtering (via the `sriov` channel, since v0.1.3)
 
-When `sriov_state` points at a JSON dump produced by the [`sriov`
-CLI](https://github.com/andrew-d/proxmox-service-discovery) (`sriov dump`),
-the plugin learns which hardware MAC belongs to each guest's SR-IOV VF(s)
-and uses it to filter the qemu-agent / lxc interface response.
+When `sriov_state` points at a JSON dump file describing which SR-IOV VFs
+are assigned to which guest, the plugin learns which hardware MAC belongs
+to each guest's SR-IOV VF(s) and uses it to filter the qemu-agent / lxc
+interface response. Producing the dump is out of scope for this repo —
+any tool that writes the schema below on a regular cadence works.
 
-Producer side (on the PVE host):
+Producer side (on the PVE host): run whatever tool emits the schema and
+atomically rename into place on a timer, e.g.
 
 ```
 # systemd timer, every 30 s or so
-sriov dump > /var/lib/sriov-state/dump.json.tmp \
+your-sriov-dump-tool > /var/lib/sriov-state/dump.json.tmp \
   && mv /var/lib/sriov-state/dump.json.tmp /var/lib/sriov-state/dump.json
 ```
 
 Consumer side (the plugin): the dump file is read-only bind-mounted into
 the CT that runs CoreDNS; `sriov_state /var/lib/sriov-state/dump.json` in
-the Corefile. The plugin re-reads on mtime change, so the timer rewrites
-pick up without restart.
+the Corefile. The plugin re-reads on mtime change, so timer rewrites pick
+up without restart.
 
 Schema consumed: `correlatedVfs[].vf.{kind, adminMac}` and
 `correlatedVfs[].consumers[]` with kinds `vm-direct`, `vm-via-mapping`
@@ -116,7 +118,7 @@ Schema consumed: `correlatedVfs[].vf.{kind, adminMac}` and
 GPU VFs (no MAC), host-owned VFs, unused VFs.
 
 The `sriov` channel claims interfaces whose hardware MAC equals an
-adminMac recorded in `sriov dump` for this guest. The match is exact —
+adminMac recorded in the dump for this guest. The match is exact —
 much more precise than CIDR heuristics, since a VF's adminMac is pinned
 by the PF driver at boot and can't collide with a docker bridge or
 netbird interface. `allow_cidr` / `exclude_ip` still apply *after*

@@ -46,6 +46,7 @@ type supervisor struct {
 
 	allowCIDRs []netip.Prefix
 	excludeIPs []netip.Addr
+	sriov      *sriovState // may be nil (no sriov_state configured)
 
 	enumerateEvery time.Duration // cluster-list reconcile cadence
 	pollNever      time.Duration // per-guest cadence while no IPs yet
@@ -57,7 +58,7 @@ type supervisor struct {
 }
 
 func newSupervisor(client pveapi.Client, st *store, zones []string,
-	allow []netip.Prefix, exclude []netip.Addr,
+	allow []netip.Prefix, exclude []netip.Addr, sriov *sriovState,
 	enumerateEvery, pollNever, pollKnown time.Duration) *supervisor {
 	return &supervisor{
 		client:         client,
@@ -65,6 +66,7 @@ func newSupervisor(client pveapi.Client, st *store, zones []string,
 		zones:          zones,
 		allowCIDRs:     allow,
 		excludeIPs:     exclude,
+		sriov:          sriov,
 		enumerateEvery: enumerateEvery,
 		pollNever:      pollNever,
 		pollKnown:      pollKnown,
@@ -128,6 +130,13 @@ func (g guestMeta) fqdn(zones []string) string {
 // transiently-unreachable node. Existing goroutines keep running with
 // their last-known state.
 func (s *supervisor) reconcile(ctx context.Context) {
+	// Refresh the on-disk SR-IOV state once per reconcile cycle. Per-guest
+	// goroutines read from the same cache — keeps disk / parse work to one
+	// call per tick rather than once per guest.
+	if s.sriov != nil {
+		s.sriov.refresh()
+	}
+
 	meta, err := s.enumerate(ctx)
 	if err != nil {
 		log.Warningf("cluster enumerate failed, skipping reconcile: %v", err)
@@ -226,7 +235,11 @@ func (s *supervisor) pollGuest(ctx context.Context, g guestMeta) {
 
 	hasSucceeded := false
 	for {
-		ips, err := s.fetchGuestIPs(ctx, g.ID)
+		// Re-resolve expected MACs every poll — the supervisor refreshes
+		// the SR-IOV cache each reconcile tick (60s), so this is a cheap
+		// map lookup that reflects any new VF assignment since last poll.
+		expectedMacs, _ := s.sriov.lookup(g.ID.VMID)
+		ips, err := s.fetchGuestIPs(ctx, g.ID, expectedMacs)
 		switch {
 		case err != nil:
 			log.Debugf("fetch IPs %s/%d on %s: %v — keeping last record", g.ID.Type, g.ID.VMID, g.ID.Node, err)
@@ -258,27 +271,41 @@ func (s *supervisor) pollGuest(ctx context.Context, g guestMeta) {
 	}
 }
 
-func (s *supervisor) fetchGuestIPs(ctx context.Context, gid guestID) ([]net.IP, error) {
+// fetchGuestIPs returns the LAN IPs attributed to a guest.
+//
+// When expectedMacs is non-empty, interfaces are pre-filtered by MAC match
+// — we keep IPs only from interfaces whose hardware-address is in the set.
+// This is the SR-IOV fast-path: the admin MACs come from `sriov dump`, and
+// matching on them is exact (docker / podman / netbird can't accidentally
+// match since they have different MACs even if they share the LAN CIDR).
+//
+// When expectedMacs is empty (guest not in sriov state, or sriov_state not
+// configured), we fall back to name-prefix heuristics to drop obvious
+// noise interfaces and rely on allow_cidr / exclude_ip for the rest.
+//
+// allow_cidr / exclude_ip always applies on top — it lets the operator
+// drop IPs they know are wrong even when the interface "looks" right.
+func (s *supervisor) fetchGuestIPs(ctx context.Context, gid guestID, expectedMacs []string) ([]net.IP, error) {
 	rc, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	switch gid.Type {
 	case "lxc":
-		return s.fetchLXCIPs(rc, gid)
+		return s.fetchLXCIPs(rc, gid, expectedMacs)
 	case "qemu":
-		return s.fetchQEMUIPs(rc, gid)
+		return s.fetchQEMUIPs(rc, gid, expectedMacs)
 	default:
 		return nil, fmt.Errorf("unknown guest type: %s", gid.Type)
 	}
 }
 
-func (s *supervisor) fetchLXCIPs(ctx context.Context, gid guestID) ([]net.IP, error) {
+func (s *supervisor) fetchLXCIPs(ctx context.Context, gid guestID, expectedMacs []string) ([]net.IP, error) {
 	ifs, err := s.client.GetLXCInterfaces(ctx, gid.Node, gid.VMID)
 	if err != nil {
 		return nil, err
 	}
 	var ips []net.IP
 	for _, ifc := range ifs {
-		if ifc.Name == "lo" {
+		if !keepInterface(ifc.Name, ifc.HardwareAddress, expectedMacs) {
 			continue
 		}
 		for _, raw := range []string{ifc.Inet, ifc.Inet6} {
@@ -288,19 +315,14 @@ func (s *supervisor) fetchLXCIPs(ctx context.Context, gid guestID) ([]net.IP, er
 	return filterIPs(ips, s.allowCIDRs, s.excludeIPs), nil
 }
 
-func (s *supervisor) fetchQEMUIPs(ctx context.Context, gid guestID) ([]net.IP, error) {
+func (s *supervisor) fetchQEMUIPs(ctx context.Context, gid guestID, expectedMacs []string) ([]net.IP, error) {
 	resp, err := s.client.GetQEMUInterfaces(ctx, gid.Node, gid.VMID)
 	if err != nil {
 		return nil, err
 	}
 	var ips []net.IP
 	for _, ifc := range resp.Result {
-		if ifc.Name == "lo" ||
-			strings.HasPrefix(ifc.Name, "docker") ||
-			strings.HasPrefix(ifc.Name, "br-") ||
-			strings.HasPrefix(ifc.Name, "veth") ||
-			strings.HasPrefix(ifc.Name, "cni-") ||
-			ifc.Name == "wt0" {
+		if !keepInterface(ifc.Name, ifc.HardwareAddress, expectedMacs) {
 			continue
 		}
 		for _, a := range ifc.IPAddresses {
@@ -308,6 +330,26 @@ func (s *supervisor) fetchQEMUIPs(ctx context.Context, gid guestID) ([]net.IP, e
 		}
 	}
 	return filterIPs(ips, s.allowCIDRs, s.excludeIPs), nil
+}
+
+// keepInterface decides whether a given guest interface contributes IPs.
+//
+//   - expectedMacs empty  → name-based heuristic (drop known-noise prefixes).
+//   - expectedMacs non-nil → MAC exact match only; no name heuristic because
+//     the MAC identity is authoritative.
+func keepInterface(name, hwaddr string, expectedMacs []string) bool {
+	if len(expectedMacs) > 0 {
+		return macInSet(hwaddr, expectedMacs)
+	}
+	if name == "lo" ||
+		strings.HasPrefix(name, "docker") ||
+		strings.HasPrefix(name, "br-") ||
+		strings.HasPrefix(name, "veth") ||
+		strings.HasPrefix(name, "cni-") ||
+		name == "wt0" {
+		return false
+	}
+	return true
 }
 
 // withJitter spreads a base interval by ±frac (0.1 = ±10%). Prevents every

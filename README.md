@@ -48,12 +48,51 @@ Directive reference:
 | `token_secret_file` | one of | path to a file containing the secret |
 | `allow_cidr` | no | one or more CIDRs; if any given, only IPs in one of these CIDRs are returned. Repeatable; multiple values on one line allowed |
 | `exclude_ip` | no | drop these specific IPs from every emitted record. Use for IPs already claimed by a static source (e.g. authoritative host file, hypervisor secondary NICs). Repeatable; multiple values on one line allowed |
+| `sriov_state` | no | path to a JSON file produced by `sriov dump` (run on the PVE host, shipped to the plugin via a bind mount). When present, the plugin filters per-guest interfaces by hardware MAC against the SR-IOV VF adminMacs the guest owns. More precise than `allow_cidr` — MAC identity is exact whereas CIDRs can match unrelated bridges that happen to share the subnet |
 | `insecure_skip_verify` | no | accept self-signed PVE certs |
 | `reconcile_every` | no | how often the supervisor re-enumerates the cluster to spawn/cancel per-guest goroutines. Default `60s`. `refresh` is accepted as a back-compat alias |
 | `poll_never_ips` | no | per-guest poll cadence *until that guest first returns IPs*. Default `60s` — keep this short so slow-booting VMs show up in DNS soon after agent becomes responsive |
 | `poll_known_ips` | no | per-guest poll cadence *after* first success. Default `5m` — long enough to avoid hammering PVE, short enough to catch an IP change within minutes |
 | `ttl` | no | A/AAAA record TTL (default `60`) |
 | `fallthrough` | no | on no-match, hand off to the next plugin in the chain |
+
+## SR-IOV MAC filtering (optional, since v0.1.3)
+
+When `sriov_state` points at a JSON dump produced by the [`sriov`
+CLI](https://github.com/andrew-d/proxmox-service-discovery) (`sriov dump`),
+the plugin learns which hardware MAC belongs to each guest's SR-IOV VF(s)
+and uses it to filter the qemu-agent / lxc interface response.
+
+Producer side (on the PVE host):
+
+```
+# systemd timer, every 30 s or so
+sriov dump > /var/lib/sriov-state/dump.json.tmp \
+  && mv /var/lib/sriov-state/dump.json.tmp /var/lib/sriov-state/dump.json
+```
+
+Consumer side (the plugin): the dump file is read-only bind-mounted into
+the CT that runs CoreDNS; `sriov_state /var/lib/sriov-state/dump.json` in
+the Corefile. The plugin re-reads on mtime change, so the timer rewrites
+pick up without restart.
+
+Schema consumed: `correlatedVfs[].vf.{kind, adminMac}` and
+`correlatedVfs[].consumers[]` with kinds `vm-direct`, `vm-via-mapping`
+(multiple `vmids`), and `container-phys`. Everything else is ignored —
+GPU VFs (no MAC), host-owned VFs, unused VFs.
+
+Behaviour per guest at poll time:
+
+- Guest has one or more MACs in the state → only interfaces whose
+  hardware MAC matches one of them contribute IPs. Name-heuristic
+  (lo / docker / br-… / veth / cni- / wt0) is skipped in this path
+  because MAC identity is authoritative.
+- Guest has no MACs (no SR-IOV — e.g. a CT on a normal vmbr) → falls
+  back to the name-heuristic, then `allow_cidr` + `exclude_ip`.
+
+`allow_cidr` / `exclude_ip` still applies on top of MAC-matched IPs, so
+an operator can still carve out (for example) IPv6 globals from the
+SR-IOV interface.
 
 ## Cold-start + slow-boot design
 

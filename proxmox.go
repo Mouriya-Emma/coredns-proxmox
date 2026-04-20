@@ -64,6 +64,12 @@ type Proxmox struct {
 	// an authoritative source (static hosts file, other PVE NICs).
 	ExcludeIPs []netip.Addr
 
+	// SriovStatePath, if set, is the on-disk path (usually a bind-mounted
+	// file from PVE host) containing `sriov dump` JSON. When present, the
+	// plugin filters per-guest interfaces by hardware MAC against the SR-IOV
+	// VF adminMacs that this guest owns — more precise than allow_cidr.
+	SriovStatePath string
+
 	// Fallthrough hands off to the next plugin on no-match.
 	Fallthrough bool
 
@@ -138,7 +144,11 @@ func (p *Proxmox) Start() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	p.cancel = cancel
 	p.store = newStore()
-	p.sup = newSupervisor(p.client, p.store, p.Zones, p.AllowCIDRs, p.ExcludeIPs,
+	var sriov *sriovState
+	if p.SriovStatePath != "" {
+		sriov = newSriovState(p.SriovStatePath)
+	}
+	p.sup = newSupervisor(p.client, p.store, p.Zones, p.AllowCIDRs, p.ExcludeIPs, sriov,
 		p.ReconcileEvery, p.PollNever, p.PollKnown)
 	go p.sup.Run(ctx)
 	return nil

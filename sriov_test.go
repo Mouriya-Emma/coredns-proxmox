@@ -133,48 +133,49 @@ func TestSriovState_MissingFile_NoPanic(t *testing.T) {
 	}
 }
 
-func TestKeepInterface_MACMatchAuthoritativelyKeeps(t *testing.T) {
-	// SR-IOV VF MAC match always keeps, even if the name would otherwise be
-	// filtered (defensive: unusual ifname shouldn't drop a confirmed VF).
-	expected := []string{"44:cc:77:00:00:05"}
-	if !keepInterface("enp1s0", "44:cc:77:00:00:05", expected) {
-		t.Error("MAC-matched real NIC must be kept")
+// Channel tests. These exercise each channel's Claims directly — the
+// supervisor just ORs the results across channels, so per-channel
+// correctness + the integration smoke in the real deployment together
+// cover the interesting behaviour.
+
+func TestSriovChannel_ClaimsByMAC(t *testing.T) {
+	s := newStore()
+	_ = s
+	st := newSriovState("")
+	st.vmMacs[102] = []string{"44:cc:77:00:00:05"}
+	st.vmMacs[380] = []string{"44:cc:77:00:00:0f"}
+	ch := newSriovChannel(st)
+
+	vm102 := guestID{Node: "pve", Type: "qemu", VMID: 102}
+	ct380 := guestID{Node: "pve", Type: "lxc", VMID: 380}
+	unknown := guestID{Node: "pve", Type: "qemu", VMID: 999}
+
+	if !ch.Claims(vm102, InterfaceInfo{Name: "enp1s0", Mac: "44:cc:77:00:00:05"}) {
+		t.Error("vm102: MAC match must be claimed")
 	}
-	if !keepInterface("docker0", "44:CC:77:00:00:05", expected) {
-		t.Error("MAC match (case-insensitive) overrides docker0 name drop")
+	if !ch.Claims(vm102, InterfaceInfo{Name: "docker0", Mac: "44:CC:77:00:00:05"}) {
+		t.Error("vm102: MAC match (case-insensitive) overrides even docker0 name")
 	}
-	if !keepInterface("br-weird-vf", "44:cc:77:00:00:05", expected) {
-		t.Error("MAC match overrides br- name drop")
+	if ch.Claims(vm102, InterfaceInfo{Name: "enp1s0", Mac: "02:00:00:00:00:01"}) {
+		t.Error("vm102: non-matching MAC must NOT be claimed by sriov")
+	}
+	if !ch.Claims(ct380, InterfaceInfo{Name: "eth0vf15", Mac: "44:cc:77:00:00:0f"}) {
+		t.Error("ct380: container-phys VF MAC must be claimed")
+	}
+	if ch.Claims(unknown, InterfaceInfo{Name: "any", Mac: "44:cc:77:00:00:05"}) {
+		t.Error("unknown vmid: sriov channel has nothing to claim on")
 	}
 }
 
-func TestKeepInterface_AdditiveWithOtherLegitimateInterfaces(t *testing.T) {
-	// The key fix (homelab-tf feedback): a guest with SR-IOV + net0 on vmbr
-	// should have *both* interfaces contribute IPs. Earlier exclusive-MAC
-	// gating silently dropped net0.
-	expected := []string{"44:cc:77:00:00:05"}
-	// SR-IOV VF — kept by MAC match
-	if !keepInterface("enp1s0", "44:cc:77:00:00:05", expected) {
-		t.Error("SR-IOV MAC must be kept")
-	}
-	// net0 on vmbr with a different MAC — kept by name heuristic, not dropped
-	if !keepInterface("enp6s18", "bc:24:11:aa:bb:cc", expected) {
-		t.Error("non-SR-IOV real NIC must be kept additively")
-	}
-	// A second regular eth — kept
-	if !keepInterface("eth1", "02:00:00:00:00:01", expected) {
-		t.Error("generic eth must be kept additively")
-	}
-	// Known-noise still dropped even when expectedMacs is set
-	if keepInterface("docker0", "02:42:ac:11:00:02", expected) {
-		t.Error("docker with unrelated MAC must still be dropped by name")
-	}
-	if keepInterface("wt0", "00:00:00:00:00:00", expected) {
-		t.Error("wt0 must always be dropped")
+func TestSriovChannel_NilStateNeverClaims(t *testing.T) {
+	ch := newSriovChannel(nil)
+	if ch.Claims(guestID{VMID: 1}, InterfaceInfo{Mac: "any"}) {
+		t.Error("nil state must claim nothing")
 	}
 }
 
-func TestKeepInterface_NameHeuristicWhenNoMACs(t *testing.T) {
+func TestPermissiveChannel_DropsKnownNoise(t *testing.T) {
+	ch := newPermissiveChannel(nil, nil) // defaults
 	cases := []struct {
 		name string
 		want bool
@@ -182,18 +183,67 @@ func TestKeepInterface_NameHeuristicWhenNoMACs(t *testing.T) {
 		{"enp1s0", true},
 		{"eth0", true},
 		{"net0", true},
+		{"enp6s18", true},
 		{"lo", false},
 		{"docker0", false},
 		{"br-abc123", false},
-		{"veth123", false},
+		{"veth12", false},
 		{"cni-podman0", false},
 		{"wt0", false},
 	}
 	for _, c := range cases {
-		got := keepInterface(c.name, "any:mac:here:00:00:00", nil)
+		got := ch.Claims(guestID{}, InterfaceInfo{Name: c.name, Mac: "any"})
 		if got != c.want {
-			t.Errorf("%s: want %v, got %v", c.name, c.want, got)
+			t.Errorf("permissive Claims(%q) = %v, want %v", c.name, got, c.want)
 		}
+	}
+}
+
+func TestChannels_AllowListCombinesAdditively(t *testing.T) {
+	// The original motivation: a guest with an SR-IOV VF and a vmbr net0
+	// should have both surfaced. Neither channel alone covers both; the
+	// supervisor's claimsAny ORs them together.
+	st := newSriovState("")
+	st.vmMacs[102] = []string{"44:cc:77:00:00:05"}
+	chans := []Channel{
+		newSriovChannel(st),
+		newPermissiveChannel(nil, nil),
+	}
+	vm := guestID{VMID: 102}
+
+	// SR-IOV VF — sriov channel claims
+	if !claimsAny(chans, vm, InterfaceInfo{Name: "enp1s0", Mac: "44:cc:77:00:00:05"}) {
+		t.Error("SR-IOV VF must be claimed")
+	}
+	// vmbr net0 with a totally different MAC — permissive channel claims by name
+	if !claimsAny(chans, vm, InterfaceInfo{Name: "enp6s18", Mac: "bc:24:11:aa:bb:cc"}) {
+		t.Error("non-SR-IOV vmbr interface must be claimed additively by permissive")
+	}
+	// docker0 — neither channel claims; stays dropped
+	if claimsAny(chans, vm, InterfaceInfo{Name: "docker0", Mac: "02:42:ac:11:00:02"}) {
+		t.Error("docker0 must not be claimed by any channel")
+	}
+	// docker0 with an SR-IOV-matching MAC — sriov claims (authoritative
+	// override of name-based drop; defensive against weird ifnames)
+	if !claimsAny(chans, vm, InterfaceInfo{Name: "docker0", Mac: "44:cc:77:00:00:05"}) {
+		t.Error("MAC-matched VF named docker0 must still be claimed (authoritative)")
+	}
+}
+
+func TestChannels_StrictAllowListNoPermissive(t *testing.T) {
+	// With only sriov channel (permissive off — the new default), any
+	// interface not in the MAC set is dropped — even a sensible-looking
+	// enp1s0 with a non-SR-IOV MAC.
+	st := newSriovState("")
+	st.vmMacs[102] = []string{"44:cc:77:00:00:05"}
+	chans := []Channel{newSriovChannel(st)}
+	vm := guestID{VMID: 102}
+
+	if !claimsAny(chans, vm, InterfaceInfo{Name: "enp1s0", Mac: "44:cc:77:00:00:05"}) {
+		t.Error("SR-IOV VF still claimed")
+	}
+	if claimsAny(chans, vm, InterfaceInfo{Name: "enp6s18", Mac: "bc:24:11:aa:bb:cc"}) {
+		t.Error("non-SR-IOV interface must be dropped when only sriov channel is enabled")
 	}
 }
 

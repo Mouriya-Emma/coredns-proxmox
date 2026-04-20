@@ -65,10 +65,16 @@ type Proxmox struct {
 	ExcludeIPs []netip.Addr
 
 	// SriovStatePath, if set, is the on-disk path (usually a bind-mounted
-	// file from PVE host) containing `sriov dump` JSON. When present, the
-	// plugin filters per-guest interfaces by hardware MAC against the SR-IOV
-	// VF adminMacs that this guest owns — more precise than allow_cidr.
+	// file from PVE host) containing `sriov dump` JSON. When present the
+	// SR-IOV channel activates — see channel.go for the allow-list model.
 	SriovStatePath string
+
+	// PermissiveChannel opts in to the legacy v0.1.4-style deny-list
+	// behaviour: every interface whose name isn't known-noise contributes
+	// IPs. Default off. Useful for guests with neither SR-IOV nor an
+	// explicitly-tracked net0, where "anything sensible-looking" is
+	// better than nothing.
+	PermissiveChannel bool
 
 	// Fallthrough hands off to the next plugin on no-match.
 	Fallthrough bool
@@ -144,11 +150,28 @@ func (p *Proxmox) Start() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	p.cancel = cancel
 	p.store = newStore()
-	var sriov *sriovState
+
+	// Build the channel list. Order matters only for logging ("first
+	// channel that claims wins"); the claim set is the same regardless
+	// since claimsAny is a boolean OR.
+	var channels []Channel
 	if p.SriovStatePath != "" {
-		sriov = newSriovState(p.SriovStatePath)
+		channels = append(channels, newSriovChannel(newSriovState(p.SriovStatePath)))
 	}
-	p.sup = newSupervisor(p.client, p.store, p.Zones, p.AllowCIDRs, p.ExcludeIPs, sriov,
+	if p.PermissiveChannel {
+		channels = append(channels, newPermissiveChannel(nil, nil))
+	}
+	if len(channels) == 0 {
+		log.Warningf("no channels enabled (sriov_state unset, permissive off) — plugin will never resolve anything; set sriov_state or `permissive` in the Corefile")
+	} else {
+		names := make([]string, 0, len(channels))
+		for _, ch := range channels {
+			names = append(names, ch.Name())
+		}
+		log.Infof("channels enabled: %s", strings.Join(names, ", "))
+	}
+
+	p.sup = newSupervisor(p.client, p.store, p.Zones, p.AllowCIDRs, p.ExcludeIPs, channels,
 		p.ReconcileEvery, p.PollNever, p.PollKnown)
 	go p.sup.Run(ctx)
 	return nil

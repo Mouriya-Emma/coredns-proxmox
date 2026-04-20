@@ -48,7 +48,8 @@ Directive reference:
 | `token_secret_file` | one of | path to a file containing the secret |
 | `allow_cidr` | no | one or more CIDRs; if any given, only IPs in one of these CIDRs are returned. Repeatable; multiple values on one line allowed |
 | `exclude_ip` | no | drop these specific IPs from every emitted record. Use for IPs already claimed by a static source (e.g. authoritative host file, hypervisor secondary NICs). Repeatable; multiple values on one line allowed |
-| `sriov_state` | no | path to a JSON file produced by `sriov dump` (run on the PVE host, shipped to the plugin via a bind mount). When present, the plugin filters per-guest interfaces by hardware MAC against the SR-IOV VF adminMacs the guest owns. More precise than `allow_cidr` — MAC identity is exact whereas CIDRs can match unrelated bridges that happen to share the subnet |
+| `sriov_state` | no | path to a JSON file produced by `sriov dump` (run on the PVE host, shipped to the plugin via a bind mount). Enables the `sriov` channel — see below |
+| `permissive` | no | opt in to the `permissive` channel — keeps every interface whose name isn't known-noise (`lo`, `docker*`, `br-*`, `veth*`, `cni-*`, `wt0`). Deny-list heuristic; useful fallback when no other channel covers a guest. Off by default (strict allow-list) since v0.1.5 |
 | `insecure_skip_verify` | no | accept self-signed PVE certs |
 | `reconcile_every` | no | how often the supervisor re-enumerates the cluster to spawn/cancel per-guest goroutines. Default `60s`. `refresh` is accepted as a back-compat alias |
 | `poll_never_ips` | no | per-guest poll cadence *until that guest first returns IPs*. Default `60s` — keep this short so slow-booting VMs show up in DNS soon after agent becomes responsive |
@@ -56,7 +57,38 @@ Directive reference:
 | `ttl` | no | A/AAAA record TTL (default `60`) |
 | `fallthrough` | no | on no-match, hand off to the next plugin in the chain |
 
-## SR-IOV MAC filtering (optional, since v0.1.3)
+## Channels (since v0.1.5)
+
+The plugin is **strict allow-list**: an interface on a guest contributes
+IPs only if at least one *channel* positively claims it. Channels are
+discrete sources of identity information, each with its own mechanism
+for deciding "this interface on this guest is a service address."
+
+Built-in channels:
+
+| channel | enable | what it claims |
+|---|---|---|
+| `sriov` | `sriov_state <path>` | interfaces whose hardware MAC matches an SR-IOV VF adminMac recorded in `sriov dump` output for this guest |
+| `permissive` | `permissive` | every interface whose name isn't in a short deny-list (`lo`, `docker*`, `br-*`, `veth*`, `cni-*`, `wt0`). The legacy v0.1.4 default, now opt-in |
+
+Guest enumeration is always PVE (`GetNodes` → `GetQEMUVMs` / `GetLXCs`),
+orthogonal to channels. Guest type (VM vs CT) is orthogonal to channel
+too — each channel handles both internally if its source needs to
+(`sriov dump` already unifies `vm-direct` / `vm-via-mapping` /
+`container-phys` into `vmid → [adminMac]`).
+
+Adding channels is how the plugin grows. Planned / plausible:
+- `net0` — reads PVE's `qm/pct config <vmid>` for the guest's `net0`
+  MAC + bridge, claims that interface. Covers guests on a vmbr without
+  SR-IOV.
+- `ssh` — escape hatch for guests with neither qemu-agent nor SR-IOV:
+  SSH in, `ip addr show`, claim whatever matches a per-guest rule.
+- `static` — operator-declared `vmid → ifname` or `vmid → mac` map.
+
+With no channels enabled, the plugin starts and logs a warning but
+never resolves anything — the Corefile should configure at least one.
+
+## SR-IOV MAC filtering (via the `sriov` channel, since v0.1.3)
 
 When `sriov_state` points at a JSON dump produced by the [`sriov`
 CLI](https://github.com/andrew-d/proxmox-service-discovery) (`sriov dump`),
@@ -81,25 +113,13 @@ Schema consumed: `correlatedVfs[].vf.{kind, adminMac}` and
 (multiple `vmids`), and `container-phys`. Everything else is ignored —
 GPU VFs (no MAC), host-owned VFs, unused VFs.
 
-Behaviour per interface at poll time (**additive**, not exclusive):
-
-- Interface's MAC matches one of the guest's SR-IOV adminMacs → keep.
-  Authoritative include: this is a confirmed VF belonging to the guest,
-  regardless of the ifname (defensive against unusual names).
-- Otherwise → name heuristic. Drop known-noise prefixes (`lo`, `docker*`,
-  `br-*`, `veth*`, `cni-*`, `wt0`). Keep everything else (`ethN`,
-  `enpNsN`, `net0`, etc.).
-
-This combines channels rather than replacing them. A guest with an
-SR-IOV VF plus a regular `net0` on a vmbr will have **both**
-interfaces' IPs surfaced. An earlier version of this plugin gated
-solely on MAC when `sriov_state` was set, silently dropping the
-vmbr-side NIC — that was wrong: SR-IOV is one discovery channel, not
-an exclusive filter.
-
-`allow_cidr` / `exclude_ip` still apply *after* this on the IPs
-themselves, so an operator can trim IPv6 globals, unrelated bridge
-ranges, etc. at the address level.
+The `sriov` channel claims interfaces whose hardware MAC equals an
+adminMac recorded in `sriov dump` for this guest. The match is exact —
+much more precise than CIDR heuristics, since a VF's adminMac is pinned
+by the PF driver at boot and can't collide with a docker bridge or
+netbird interface. `allow_cidr` / `exclude_ip` still apply *after*
+claims on the IP list, so an operator can trim IPv6 globals or
+unrelated addresses at the IP level.
 
 ## Cold-start + slow-boot design
 

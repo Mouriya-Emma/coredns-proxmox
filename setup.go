@@ -49,6 +49,7 @@ func parse(c *caddy.Controller) (*Proxmox, error) {
 		allowCIDRs      []netip.Prefix
 		excludeIPs      []netip.Addr
 		sriovStatePath  string
+		permissive      bool
 		reconcileEvery  = 60 * time.Second
 		pollNever       = 60 * time.Second
 		pollKnown       = 5 * time.Minute
@@ -121,6 +122,14 @@ func parse(c *caddy.Controller) (*Proxmox, error) {
 					return nil, c.ArgErr()
 				}
 				sriovStatePath = c.Val()
+			case "permissive":
+				// Opt-in. With no arg, turns the permissive channel on with
+				// default drop-lists (docker*, br-*, veth*, cni-*, lo, wt0).
+				// Future: may accept override flags here.
+				permissive = true
+				if args := c.RemainingArgs(); len(args) > 0 {
+					return nil, c.Errf("permissive takes no args (got %v)", args)
+				}
 			case "refresh":
 				// Back-compat alias for reconcile_every: old Corefiles may
 				// still set `refresh`. New three-knob form is preferred.
@@ -214,16 +223,17 @@ func parse(c *caddy.Controller) (*Proxmox, error) {
 	client := pveapi.NewClient(httpc, strings.TrimRight(endpoint, "/"), auth)
 
 	return &Proxmox{
-		Zones:          zones,
-		TTL:            ttl,
-		ReconcileEvery: reconcileEvery,
-		PollNever:      pollNever,
-		PollKnown:      pollKnown,
-		AllowCIDRs:     allowCIDRs,
-		ExcludeIPs:     excludeIPs,
-		SriovStatePath: sriovStatePath,
-		Fallthrough:    fall,
-		client:         client,
+		Zones:             zones,
+		TTL:               ttl,
+		ReconcileEvery:    reconcileEvery,
+		PollNever:         pollNever,
+		PollKnown:         pollKnown,
+		AllowCIDRs:        allowCIDRs,
+		ExcludeIPs:        excludeIPs,
+		SriovStatePath:    sriovStatePath,
+		PermissiveChannel: permissive,
+		Fallthrough:       fall,
+		client:            client,
 	}, nil
 }
 

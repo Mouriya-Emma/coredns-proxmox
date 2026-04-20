@@ -334,12 +334,26 @@ func (s *supervisor) fetchQEMUIPs(ctx context.Context, gid guestID, expectedMacs
 
 // keepInterface decides whether a given guest interface contributes IPs.
 //
-//   - expectedMacs empty  → name-based heuristic (drop known-noise prefixes).
-//   - expectedMacs non-nil → MAC exact match only; no name heuristic because
-//     the MAC identity is authoritative.
+// SR-IOV MAC matching is *additive*, not exclusive. A guest may legitimately
+// carry service IPs on several paths — an SR-IOV VF, net0 on a vmbr bridge,
+// or other NIC — and service discovery should surface all of them. Earlier
+// versions gated solely on MAC when sriov_state was available, which silently
+// dropped net0-on-vmbr interfaces even though they were legitimate service
+// addresses.
+//
+// Decision:
+//   - MAC match against expectedMacs → authoritative keep. The SR-IOV VF is
+//     guaranteed to be the right interface, regardless of name (defensive
+//     against unusual ifname patterns).
+//   - Otherwise → name heuristic. Drop known-noise prefixes (docker, br-<hash>,
+//     veth, cni-, wt0 for netbird) and lo. Keep everything else, including
+//     generic ethN / enpNsN / net0.
+//
+// allow_cidr + exclude_ip still run after this on the IPs themselves, so an
+// operator can trim whatever slips through at the address level.
 func keepInterface(name, hwaddr string, expectedMacs []string) bool {
-	if len(expectedMacs) > 0 {
-		return macInSet(hwaddr, expectedMacs)
+	if len(expectedMacs) > 0 && macInSet(hwaddr, expectedMacs) {
+		return true
 	}
 	if name == "lo" ||
 		strings.HasPrefix(name, "docker") ||

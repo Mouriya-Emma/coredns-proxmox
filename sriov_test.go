@@ -133,16 +133,44 @@ func TestSriovState_MissingFile_NoPanic(t *testing.T) {
 	}
 }
 
-func TestKeepInterface_MACGateWhenExpected(t *testing.T) {
+func TestKeepInterface_MACMatchAuthoritativelyKeeps(t *testing.T) {
+	// SR-IOV VF MAC match always keeps, even if the name would otherwise be
+	// filtered (defensive: unusual ifname shouldn't drop a confirmed VF).
 	expected := []string{"44:cc:77:00:00:05"}
 	if !keepInterface("enp1s0", "44:cc:77:00:00:05", expected) {
-		t.Error("matching MAC must be kept")
+		t.Error("MAC-matched real NIC must be kept")
 	}
 	if !keepInterface("docker0", "44:CC:77:00:00:05", expected) {
-		t.Error("matching MAC (case-insensitive) must be kept — name heuristic bypassed")
+		t.Error("MAC match (case-insensitive) overrides docker0 name drop")
 	}
-	if keepInterface("enp1s0", "02:42:ac:11:00:02", expected) {
-		t.Error("non-matching MAC must be dropped")
+	if !keepInterface("br-weird-vf", "44:cc:77:00:00:05", expected) {
+		t.Error("MAC match overrides br- name drop")
+	}
+}
+
+func TestKeepInterface_AdditiveWithOtherLegitimateInterfaces(t *testing.T) {
+	// The key fix (homelab-tf feedback): a guest with SR-IOV + net0 on vmbr
+	// should have *both* interfaces contribute IPs. Earlier exclusive-MAC
+	// gating silently dropped net0.
+	expected := []string{"44:cc:77:00:00:05"}
+	// SR-IOV VF — kept by MAC match
+	if !keepInterface("enp1s0", "44:cc:77:00:00:05", expected) {
+		t.Error("SR-IOV MAC must be kept")
+	}
+	// net0 on vmbr with a different MAC — kept by name heuristic, not dropped
+	if !keepInterface("enp6s18", "bc:24:11:aa:bb:cc", expected) {
+		t.Error("non-SR-IOV real NIC must be kept additively")
+	}
+	// A second regular eth — kept
+	if !keepInterface("eth1", "02:00:00:00:00:01", expected) {
+		t.Error("generic eth must be kept additively")
+	}
+	// Known-noise still dropped even when expectedMacs is set
+	if keepInterface("docker0", "02:42:ac:11:00:02", expected) {
+		t.Error("docker with unrelated MAC must still be dropped by name")
+	}
+	if keepInterface("wt0", "00:00:00:00:00:00", expected) {
+		t.Error("wt0 must always be dropped")
 	}
 }
 
@@ -153,6 +181,7 @@ func TestKeepInterface_NameHeuristicWhenNoMACs(t *testing.T) {
 	}{
 		{"enp1s0", true},
 		{"eth0", true},
+		{"net0", true},
 		{"lo", false},
 		{"docker0", false},
 		{"br-abc123", false},

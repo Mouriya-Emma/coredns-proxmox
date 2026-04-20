@@ -81,18 +81,25 @@ Schema consumed: `correlatedVfs[].vf.{kind, adminMac}` and
 (multiple `vmids`), and `container-phys`. Everything else is ignored —
 GPU VFs (no MAC), host-owned VFs, unused VFs.
 
-Behaviour per guest at poll time:
+Behaviour per interface at poll time (**additive**, not exclusive):
 
-- Guest has one or more MACs in the state → only interfaces whose
-  hardware MAC matches one of them contribute IPs. Name-heuristic
-  (lo / docker / br-… / veth / cni- / wt0) is skipped in this path
-  because MAC identity is authoritative.
-- Guest has no MACs (no SR-IOV — e.g. a CT on a normal vmbr) → falls
-  back to the name-heuristic, then `allow_cidr` + `exclude_ip`.
+- Interface's MAC matches one of the guest's SR-IOV adminMacs → keep.
+  Authoritative include: this is a confirmed VF belonging to the guest,
+  regardless of the ifname (defensive against unusual names).
+- Otherwise → name heuristic. Drop known-noise prefixes (`lo`, `docker*`,
+  `br-*`, `veth*`, `cni-*`, `wt0`). Keep everything else (`ethN`,
+  `enpNsN`, `net0`, etc.).
 
-`allow_cidr` / `exclude_ip` still applies on top of MAC-matched IPs, so
-an operator can still carve out (for example) IPv6 globals from the
-SR-IOV interface.
+This combines channels rather than replacing them. A guest with an
+SR-IOV VF plus a regular `net0` on a vmbr will have **both**
+interfaces' IPs surfaced. An earlier version of this plugin gated
+solely on MAC when `sriov_state` was set, silently dropping the
+vmbr-side NIC — that was wrong: SR-IOV is one discovery channel, not
+an exclusive filter.
+
+`allow_cidr` / `exclude_ip` still apply *after* this on the IPs
+themselves, so an operator can trim IPv6 globals, unrelated bridge
+ranges, etc. at the address level.
 
 ## Cold-start + slow-boot design
 

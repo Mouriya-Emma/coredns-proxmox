@@ -48,7 +48,9 @@ func parse(c *caddy.Controller) (*Proxmox, error) {
 		tokenSecretFile string
 		allowCIDRs      []netip.Prefix
 		excludeIPs      []netip.Addr
-		refresh         = 60 * time.Second
+		reconcileEvery  = 60 * time.Second
+		pollNever       = 60 * time.Second
+		pollKnown       = 5 * time.Minute
 		ttl             = uint32(60)
 		fall            = false
 	)
@@ -114,6 +116,8 @@ func parse(c *caddy.Controller) (*Proxmox, error) {
 					excludeIPs = append(excludeIPs, addr.Unmap())
 				}
 			case "refresh":
+				// Back-compat alias for reconcile_every: old Corefiles may
+				// still set `refresh`. New three-knob form is preferred.
 				if !c.NextArg() {
 					return nil, c.ArgErr()
 				}
@@ -121,7 +125,34 @@ func parse(c *caddy.Controller) (*Proxmox, error) {
 				if err != nil {
 					return nil, c.Errf("invalid refresh %q: %v", c.Val(), err)
 				}
-				refresh = d
+				reconcileEvery = d
+			case "reconcile_every":
+				if !c.NextArg() {
+					return nil, c.ArgErr()
+				}
+				d, err := time.ParseDuration(c.Val())
+				if err != nil {
+					return nil, c.Errf("invalid reconcile_every %q: %v", c.Val(), err)
+				}
+				reconcileEvery = d
+			case "poll_never_ips":
+				if !c.NextArg() {
+					return nil, c.ArgErr()
+				}
+				d, err := time.ParseDuration(c.Val())
+				if err != nil {
+					return nil, c.Errf("invalid poll_never_ips %q: %v", c.Val(), err)
+				}
+				pollNever = d
+			case "poll_known_ips":
+				if !c.NextArg() {
+					return nil, c.ArgErr()
+				}
+				d, err := time.ParseDuration(c.Val())
+				if err != nil {
+					return nil, c.Errf("invalid poll_known_ips %q: %v", c.Val(), err)
+				}
+				pollKnown = d
 			case "ttl":
 				if !c.NextArg() {
 					return nil, c.ArgErr()
@@ -177,13 +208,15 @@ func parse(c *caddy.Controller) (*Proxmox, error) {
 	client := pveapi.NewClient(httpc, strings.TrimRight(endpoint, "/"), auth)
 
 	return &Proxmox{
-		Zones:       zones,
-		TTL:         ttl,
-		Refresh:     refresh,
-		AllowCIDRs:  allowCIDRs,
-		ExcludeIPs:  excludeIPs,
-		Fallthrough: fall,
-		client:      client,
+		Zones:          zones,
+		TTL:            ttl,
+		ReconcileEvery: reconcileEvery,
+		PollNever:      pollNever,
+		PollKnown:      pollKnown,
+		AllowCIDRs:     allowCIDRs,
+		ExcludeIPs:     excludeIPs,
+		Fallthrough:    fall,
+		client:         client,
 	}, nil
 }
 

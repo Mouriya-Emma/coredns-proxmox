@@ -22,6 +22,8 @@ hb.lan:5300 {
         token_secret_file /etc/coredns/pve-token
         allow_cidr 192.168.1.0/24
         exclude_ip 192.168.1.22 192.168.1.67
+        sriov_state /var/lib/sriov-state/dump.json
+        net0
         reconcile_every 60s
         poll_never_ips 60s
         poll_known_ips 5m
@@ -49,6 +51,7 @@ Directive reference:
 | `allow_cidr` | no | one or more CIDRs; if any given, only IPs in one of these CIDRs are returned. Repeatable; multiple values on one line allowed |
 | `exclude_ip` | no | drop these specific IPs from every emitted record. Use for IPs already claimed by a static source (e.g. authoritative host file, hypervisor secondary NICs). Repeatable; multiple values on one line allowed |
 | `sriov_state` | no | path to a JSON file produced by `sriov dump` (run on the PVE host, shipped to the plugin via a bind mount). Enables the `sriov` channel — see below |
+| `net0` | no | opt in to the `net0` channel — claims the interface whose hardware MAC matches the guest's declared `net0` MAC (read from `qm config` / `pct config`). Covers guests on a regular vmbr (no SR-IOV) |
 | `permissive` | no | opt in to the `permissive` channel — keeps every interface whose name isn't known-noise (`lo`, `docker*`, `br-*`, `veth*`, `cni-*`, `wt0`). Deny-list heuristic; useful fallback when no other channel covers a guest. Off by default (strict allow-list) since v0.1.5 |
 | `insecure_skip_verify` | no | accept self-signed PVE certs |
 | `reconcile_every` | no | how often the supervisor re-enumerates the cluster to spawn/cancel per-guest goroutines. Default `60s`. `refresh` is accepted as a back-compat alias |
@@ -69,18 +72,17 @@ Built-in channels:
 | channel | enable | what it claims |
 |---|---|---|
 | `sriov` | `sriov_state <path>` | interfaces whose hardware MAC matches an SR-IOV VF adminMac recorded in `sriov dump` output for this guest |
+| `net0` | `net0` | interfaces whose hardware MAC matches the guest's declared `net0` MAC in `qm config` / `pct config`. Added in v0.1.6 |
 | `permissive` | `permissive` | every interface whose name isn't in a short deny-list (`lo`, `docker*`, `br-*`, `veth*`, `cni-*`, `wt0`). The legacy v0.1.4 default, now opt-in |
 
 Guest enumeration is always PVE (`GetNodes` → `GetQEMUVMs` / `GetLXCs`),
 orthogonal to channels. Guest type (VM vs CT) is orthogonal to channel
 too — each channel handles both internally if its source needs to
 (`sriov dump` already unifies `vm-direct` / `vm-via-mapping` /
-`container-phys` into `vmid → [adminMac]`).
+`container-phys` into `vmid → [adminMac]`; the `net0` channel dispatches
+on `gid.Type` to hit the right config endpoint).
 
 Adding channels is how the plugin grows. Planned / plausible:
-- `net0` — reads PVE's `qm/pct config <vmid>` for the guest's `net0`
-  MAC + bridge, claims that interface. Covers guests on a vmbr without
-  SR-IOV.
 - `ssh` — escape hatch for guests with neither qemu-agent nor SR-IOV:
   SSH in, `ip addr show`, claim whatever matches a per-guest rule.
 - `static` — operator-declared `vmid → ifname` or `vmid → mac` map.
@@ -120,6 +122,35 @@ by the PF driver at boot and can't collide with a docker bridge or
 netbird interface. `allow_cidr` / `exclude_ip` still apply *after*
 claims on the IP list, so an operator can trim IPv6 globals or
 unrelated addresses at the IP level.
+
+## net0 channel (via the `net0` directive, since v0.1.6)
+
+For guests on a regular Proxmox bridge (no SR-IOV), the `net0` channel
+reads the guest's PVE config — `GET /nodes/<node>/qemu/<vmid>/config` for
+VMs, `GET /nodes/<node>/lxc/<vmid>/config` for CTs — and extracts the MAC
+from the `net0` property. The plugin then claims any reported interface
+whose hardware MAC matches (case-insensitive).
+
+Accepted `net0` formats:
+
+- VM: `<model>=<mac>,bridge=<br>,...` where `<model>` is `virtio`,
+  `e1000`, `rtl8139`, `vmxnet3`, or any other NIC model.
+- CT: `name=<ifname>,bridge=<br>,hwaddr=<mac>,...`.
+
+The MAC is identified by regex-matching MAC-shaped values, not by
+hardcoding model names — so future PVE releases that introduce new NIC
+model keys work without a plugin change.
+
+The channel's cache is refreshed once per `reconcile_every` tick: a
+per-guest config fetch updates the cached MAC, and guests that
+disappeared from the cluster list are evicted. A transient per-guest
+fetch error keeps the last-known MAC (no claim flicker); a successful
+fetch that returns an empty `net0` clears the entry.
+
+`allow_cidr` / `exclude_ip` apply at the IP level after the channel
+claims the interface, so an operator doesn't need a per-channel bridge
+allow-list — off-LAN IPs get trimmed regardless of which channel
+claimed their interface.
 
 ## Cold-start + slow-boot design
 

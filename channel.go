@@ -35,21 +35,24 @@ type InterfaceInfo struct {
 //
 // Guest type (VM vs CT) is a dimension orthogonal to channel. Each Channel
 // handles both internally if its source needs to (SR-IOV dump already
-// unifies them; a future net0 channel would dispatch on gid.Type to pick
-// the right PVE config endpoint). Splitting a channel into vm-X / ct-X
-// siblings would duplicate 80% of the logic for the ~20% that differs in
-// parsing, so we keep one channel per *semantic source* instead.
+// unifies them; the net0 channel dispatches on gid.Type to pick the right
+// PVE config endpoint). Splitting a channel into vm-X / ct-X siblings
+// would duplicate 80% of the logic for the ~20% that differs in parsing,
+// so we keep one channel per *semantic source* instead.
 type Channel interface {
 	// Name is a short stable identifier used in logs ("sriov", "permissive",
 	// "net0", "ssh", ...).
 	Name() string
 
-	// OnReconcile is called once per supervisor reconcile tick, before any
-	// per-guest polling starts. Channels use it to refresh cached state
-	// (re-read an on-disk dump, re-fetch a PVE config, etc.). Failure here
-	// is non-fatal — the channel keeps its previous state and the supervisor
-	// continues with other channels.
-	OnReconcile(ctx context.Context) error
+	// OnReconcile is called once per supervisor reconcile tick, right after
+	// the cluster enumerate succeeds and before any per-guest polling
+	// starts. guests is the current running-guest set; channels that cache
+	// per-guest state use it to decide what to refresh and what to evict.
+	// Channels that don't need the list (sriov's dump is keyed by vmid
+	// regardless; permissive holds no state) simply ignore it. Failure
+	// here is non-fatal — the channel keeps its previous state and the
+	// supervisor continues with other channels.
+	OnReconcile(ctx context.Context, guests []guestID) error
 
 	// Claims returns true if this channel owns iface on the guest identified
 	// by gid. Claims must be cheap (called per-interface per-guest per-poll)

@@ -53,8 +53,8 @@ func newPermissiveChannel(dropPrefixes, dropNames []string) *permissiveChannel {
 	}
 }
 
-func (c *permissiveChannel) Name() string                         { return "permissive" }
-func (c *permissiveChannel) OnReconcile(_ context.Context) error  { return nil }
+func (c *permissiveChannel) Name() string                                            { return "permissive" }
+func (c *permissiveChannel) OnReconcile(_ context.Context, _ []guestID) error        { return nil }
 
 func (c *permissiveChannel) Claims(_ guestID, iface InterfaceInfo) bool {
 	name := iface.Name

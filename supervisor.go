@@ -134,15 +134,6 @@ func (g guestMeta) fqdn(zones []string) string {
 // transiently-unreachable node. Existing goroutines keep running with
 // their last-known state.
 func (s *supervisor) reconcile(ctx context.Context) {
-	// Give every channel a chance to refresh its cached state before the
-	// per-guest goroutines poll. Failures are non-fatal — a channel with
-	// stale data just keeps its last good view.
-	for _, ch := range s.channels {
-		if err := ch.OnReconcile(ctx); err != nil {
-			log.Warningf("channel %s reconcile refresh failed: %v", ch.Name(), err)
-		}
-	}
-
 	meta, err := s.enumerate(ctx)
 	if err != nil {
 		log.Warningf("cluster enumerate failed, skipping reconcile: %v", err)
@@ -150,8 +141,21 @@ func (s *supervisor) reconcile(ctx context.Context) {
 	}
 
 	currentSet := make(map[guestID]guestMeta, len(meta))
+	guestIDs := make([]guestID, 0, len(meta))
 	for _, g := range meta {
 		currentSet[g.ID] = g
+		guestIDs = append(guestIDs, g.ID)
+	}
+
+	// Give every channel a chance to refresh its cached state before the
+	// per-guest goroutines poll. Channels that cache per-guest config
+	// (net0, future ssh) use guestIDs to drive fetch + evict. Failures
+	// are non-fatal — a channel with stale data just keeps its last good
+	// view.
+	for _, ch := range s.channels {
+		if err := ch.OnReconcile(ctx, guestIDs); err != nil {
+			log.Warningf("channel %s reconcile refresh failed: %v", ch.Name(), err)
+		}
 	}
 
 	s.mu.Lock()

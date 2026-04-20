@@ -56,9 +56,16 @@ type supervisor struct {
 	pollNever      time.Duration // per-guest cadence while no IPs yet
 	pollKnown      time.Duration // per-guest cadence once first success
 
-	mu      sync.Mutex
+	mu sync.Mutex
+	// cancels: gid → goroutine cancel. Invariant: an entry here means
+	// there is a live pollGuest goroutine for that guest.
 	cancels map[guestID]context.CancelFunc
-	wg      sync.WaitGroup
+	// seenEmpty: gids we've already warned about for having empty Name.
+	// Keyed to suppress repeat warnings at every reconcile tick while the
+	// condition persists. Cleared when the guest either acquires a name
+	// (→ spawn) or leaves the cluster (→ evict).
+	seenEmpty map[guestID]struct{}
+	wg        sync.WaitGroup
 	// done is closed when Run returns. Stop() blocks on this so the
 	// OnShutdown hook doesn't return while the supervisor goroutine (and
 	// any in-flight per-guest goroutines it owns) are still reachable —
@@ -81,6 +88,7 @@ func newSupervisor(client pveapi.Client, st *store, zones []string,
 		pollNever:      pollNever,
 		pollKnown:      pollKnown,
 		cancels:        make(map[guestID]context.CancelFunc),
+		seenEmpty:      make(map[guestID]struct{}),
 		done:           make(chan struct{}),
 	}
 }
@@ -181,9 +189,32 @@ func (s *supervisor) reconcile(ctx context.Context) {
 				gid.Type, gid.VMID, gid.Node)
 		}
 	}
+	// Also drop seenEmpty entries for guests that left the cluster so a
+	// future reappearance warns once again rather than silently.
+	for gid := range s.seenEmpty {
+		if _, ok := currentSet[gid]; !ok {
+			delete(s.seenEmpty, gid)
+		}
+	}
 
 	// Spawn: new or restarted guests.
 	for gid, g := range currentSet {
+		if g.fqdn(s.zones) == "" {
+			// Empty name — we can't build an FQDN, so don't track until
+			// the operator gives it one. Warn exactly once per guest per
+			// empty-name stretch; the cleanup above clears the entry when
+			// the guest either gets a name or leaves the cluster.
+			if _, warned := s.seenEmpty[gid]; !warned {
+				log.Warningf("guest %s/%d on %s has empty name — not tracking until it gets one",
+					gid.Type, gid.VMID, gid.Node)
+				s.seenEmpty[gid] = struct{}{}
+			}
+			continue
+		}
+		// Name is non-empty. If we'd previously warned, the warning
+		// condition is gone — drop the bookkeeping so a future regression
+		// to empty warns again.
+		delete(s.seenEmpty, gid)
 		if _, ok := s.cancels[gid]; ok {
 			continue
 		}
@@ -249,7 +280,9 @@ func (s *supervisor) pollGuest(ctx context.Context, g guestMeta) {
 
 	fqdn := g.fqdn(s.zones)
 	if fqdn == "" {
-		log.Warningf("guest %s/%d has empty name — not polling", g.ID.Type, g.ID.VMID)
+		// Defensive: reconcile filters these out, so this path should not
+		// be reachable. Keep it as a quiet guard rather than a spawn.
+		log.Debugf("pollGuest reached with empty fqdn %s/%d — no-op", g.ID.Type, g.ID.VMID)
 		return
 	}
 

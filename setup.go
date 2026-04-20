@@ -204,8 +204,18 @@ func parse(c *caddy.Controller) (*Proxmox, error) {
 	if endpoint == "" {
 		return nil, fmt.Errorf("endpoint required")
 	}
-	if _, err := url.Parse(endpoint); err != nil {
+	// url.Parse accepts almost any non-empty string (including "foo"); force
+	// an absolute http(s) URL so misconfig surfaces at load time rather than
+	// as opaque errors on the first PVE call.
+	u, err := url.ParseRequestURI(endpoint)
+	if err != nil {
 		return nil, fmt.Errorf("invalid endpoint %q: %w", endpoint, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return nil, fmt.Errorf("invalid endpoint %q: scheme must be http or https, got %q", endpoint, u.Scheme)
+	}
+	if u.Host == "" {
+		return nil, fmt.Errorf("invalid endpoint %q: host is empty", endpoint)
 	}
 	if user == "" {
 		return nil, fmt.Errorf("user required")
@@ -215,6 +225,18 @@ func parse(c *caddy.Controller) (*Proxmox, error) {
 	}
 	if tokenSecret == "" {
 		return nil, fmt.Errorf("token_secret or token_secret_file required")
+	}
+	// A zero or negative poll/reconcile interval produces a tight busy loop
+	// (pollGuest's time.After(0) fires immediately and withJitter returns 0
+	// when delta <= 0). Surface it as config error instead of meltdown.
+	if reconcileEvery <= 0 {
+		return nil, fmt.Errorf("reconcile_every must be positive, got %s", reconcileEvery)
+	}
+	if pollNever <= 0 {
+		return nil, fmt.Errorf("poll_never_ips must be positive, got %s", pollNever)
+	}
+	if pollKnown <= 0 {
+		return nil, fmt.Errorf("poll_known_ips must be positive, got %s", pollKnown)
 	}
 
 	httpc := &http.Client{Timeout: 30 * time.Second}

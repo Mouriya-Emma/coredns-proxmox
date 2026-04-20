@@ -1,18 +1,11 @@
 package pveapi
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"log/slog"
 	"net/http"
 )
-
-const logResponses = false
-
-var logger *slog.Logger = slog.Default().With("package", "pveapi")
 
 // Client defines the interface for making requests to the Proxmox API.
 // This interface allows for mocking in tests.
@@ -111,25 +104,11 @@ func fetchFromProxmox[T any](c *HTTPClient, ctx context.Context, uri string) (T,
 		return zero, fmt.Errorf("unexpected status code %d", resp.StatusCode)
 	}
 
-	var reader io.Reader = resp.Body
-	if logResponses {
-		var buf bytes.Buffer
-		reader = io.TeeReader(resp.Body, &buf)
-
-		defer func() {
-			logger.Debug("got response from server",
-				slog.String("uri", uri),
-				slog.String("status", resp.Status),
-				slog.String("response", buf.String()),
-			)
-		}()
-	}
-
 	// All data in Proxmox is returned under the "Data" key.
 	var ret struct {
 		Data T `json:"data"`
 	}
-	if err := json.NewDecoder(reader).Decode(&ret); err != nil {
+	if err := json.NewDecoder(resp.Body).Decode(&ret); err != nil {
 		return zero, fmt.Errorf("decoding response: %w", err)
 	}
 

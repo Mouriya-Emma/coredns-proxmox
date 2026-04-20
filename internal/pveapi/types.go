@@ -27,8 +27,7 @@ type QEMU struct {
 // QEMUConfig is the API response for the configuration of a Proxmox QEMU VM from
 // the Proxmox API /api2/json/nodes/<node>/qemu/<vmid>/config endpoint.
 type QEMUConfig struct {
-	Net0      string `json:"net0"`
-	IPConfig0 string `json:"ipconfig0"`
+	Net0 string `json:"net0"`
 }
 
 // AgentInterfacesResponse is the API response for the agent interface of a Proxmox QEMU VM

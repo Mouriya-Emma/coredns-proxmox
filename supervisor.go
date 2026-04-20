@@ -211,10 +211,11 @@ func (s *supervisor) reconcile(ctx context.Context) {
 	// FQDN and the new name never appears in DNS. Detect here by diffing
 	// currentSet against lastMeta; on mismatch, cancel + drop the old
 	// store record + clear bookkeeping so the spawn loop below re-spawns
-	// with the new meta. store.Delete races minimally against the old
-	// goroutine's in-flight poll (a stale Upsert can land in the ≤1s
-	// between cancel and its next select), but the new goroutine's first
-	// successful Upsert overwrites it.
+	// with the new meta. pollGuest has a ctx.Err() check between fetch and
+	// Upsert that catches the in-flight race: after we cancel here, the
+	// old goroutine's next fetch will either fail (ctx-propagated HTTP
+	// error) or succeed then see ctx.Err() and exit before writing —
+	// either way no stale Upsert lands under the old FQDN.
 	for gid, g := range currentSet {
 		prev, tracked := s.lastMeta[gid]
 		if !tracked || prev.Name == g.Name {
@@ -324,6 +325,14 @@ func (s *supervisor) pollGuest(ctx context.Context, g guestMeta) {
 	hasSucceeded := false
 	for {
 		ips, err := s.fetchGuestIPs(ctx, g.ID)
+		// If ctx was cancelled between fetch start and here (rename
+		// detection, evict, or shutdown), don't Upsert — reconcile has
+		// already deleted this gid's record under the frozen FQDN and
+		// a late write would re-surface it until the respawned
+		// goroutine's first poll overwrites.
+		if ctx.Err() != nil {
+			return
+		}
 		switch {
 		case err != nil:
 			log.Debugf("fetch IPs %s/%d on %s: %v — keeping last record", g.ID.Type, g.ID.VMID, g.ID.Node, err)

@@ -22,7 +22,7 @@ func newSriovChannel(state *sriovState) *sriovChannel {
 
 func (c *sriovChannel) Name() string { return "sriov" }
 
-func (c *sriovChannel) OnReconcile(_ context.Context) error {
+func (c *sriovChannel) OnReconcile(_ context.Context, _ []guestID) error {
 	if c.state == nil {
 		return nil
 	}

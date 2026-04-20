@@ -76,6 +76,12 @@ type Proxmox struct {
 	// better than nothing.
 	PermissiveChannel bool
 
+	// Net0Channel opts in to the net0 channel — per-guest PVE config
+	// fetch that claims the interface whose MAC matches the guest's
+	// declared net0 MAC. Covers guests on a regular vmbr (no SR-IOV).
+	// Off by default.
+	Net0Channel bool
+
 	// Fallthrough hands off to the next plugin on no-match.
 	Fallthrough bool
 
@@ -158,11 +164,14 @@ func (p *Proxmox) Start() error {
 	if p.SriovStatePath != "" {
 		channels = append(channels, newSriovChannel(newSriovState(p.SriovStatePath)))
 	}
+	if p.Net0Channel {
+		channels = append(channels, newNet0Channel(p.client))
+	}
 	if p.PermissiveChannel {
 		channels = append(channels, newPermissiveChannel(nil, nil))
 	}
 	if len(channels) == 0 {
-		log.Warningf("no channels enabled (sriov_state unset, permissive off) — plugin will never resolve anything; set sriov_state or `permissive` in the Corefile")
+		log.Warningf("no channels enabled (sriov_state unset, net0 off, permissive off) — plugin will never resolve anything; set at least one channel in the Corefile")
 	} else {
 		names := make([]string, 0, len(channels))
 		for _, ch := range channels {

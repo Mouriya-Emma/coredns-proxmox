@@ -50,6 +50,7 @@ func parse(c *caddy.Controller) (*Proxmox, error) {
 		excludeIPs      []netip.Addr
 		sriovStatePath  string
 		permissive      bool
+		net0Channel     bool
 		reconcileEvery  = 60 * time.Second
 		pollNever       = 60 * time.Second
 		pollKnown       = 5 * time.Minute
@@ -129,6 +130,14 @@ func parse(c *caddy.Controller) (*Proxmox, error) {
 				permissive = true
 				if args := c.RemainingArgs(); len(args) > 0 {
 					return nil, c.Errf("permissive takes no args (got %v)", args)
+				}
+			case "net0":
+				// Opt-in. Reads each running guest's PVE config on
+				// reconcile, parses the net0 MAC, claims interfaces whose
+				// hardware MAC matches.
+				net0Channel = true
+				if args := c.RemainingArgs(); len(args) > 0 {
+					return nil, c.Errf("net0 takes no args (got %v)", args)
 				}
 			case "refresh":
 				// Back-compat alias for reconcile_every: old Corefiles may
@@ -232,6 +241,7 @@ func parse(c *caddy.Controller) (*Proxmox, error) {
 		ExcludeIPs:        excludeIPs,
 		SriovStatePath:    sriovStatePath,
 		PermissiveChannel: permissive,
+		Net0Channel:       net0Channel,
 		Fallthrough:       fall,
 		client:            client,
 	}, nil

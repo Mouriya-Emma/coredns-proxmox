@@ -187,10 +187,16 @@ func (p *Proxmox) Start() error {
 }
 
 // Stop cancels the supervisor and all per-guest goroutines, then waits for
-// them to return.
+// the supervisor Run loop to exit. Blocking here preserves the OnShutdown
+// invariant that "return = resources released" — without the wait, a
+// CoreDNS reload can briefly run the old plugin's supervisor alongside the
+// new one's, doubling PVE API load until the old goroutine drains.
 func (p *Proxmox) Stop() error {
 	if p.cancel != nil {
 		p.cancel()
+	}
+	if p.sup != nil {
+		<-p.sup.done
 	}
 	return nil
 }

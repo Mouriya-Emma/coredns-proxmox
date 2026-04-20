@@ -59,6 +59,12 @@ type supervisor struct {
 	mu      sync.Mutex
 	cancels map[guestID]context.CancelFunc
 	wg      sync.WaitGroup
+	// done is closed when Run returns. Stop() blocks on this so the
+	// OnShutdown hook doesn't return while the supervisor goroutine (and
+	// any in-flight per-guest goroutines it owns) are still reachable —
+	// avoids old+new supervisor coexistence across CoreDNS reload. Kept
+	// separate from wg so stopAll's wg.Wait() can't self-wait on Run.
+	done chan struct{}
 }
 
 func newSupervisor(client pveapi.Client, st *store, zones []string,
@@ -75,12 +81,16 @@ func newSupervisor(client pveapi.Client, st *store, zones []string,
 		pollNever:      pollNever,
 		pollKnown:      pollKnown,
 		cancels:        make(map[guestID]context.CancelFunc),
+		done:           make(chan struct{}),
 	}
 }
 
 // Run drives the cluster reconcile loop until ctx is cancelled. Per-guest
 // goroutines inherit a child of ctx so they all terminate on plugin shutdown.
+// Closes s.done on return so Stop() can block until the lifecycle is fully
+// unwound.
 func (s *supervisor) Run(ctx context.Context) {
+	defer close(s.done)
 	t := time.NewTicker(s.enumerateEvery)
 	defer t.Stop()
 	s.reconcile(ctx) // initial, don't wait for first tick

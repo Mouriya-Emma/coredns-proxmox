@@ -65,7 +65,13 @@ type supervisor struct {
 	// condition persists. Cleared when the guest either acquires a name
 	// (→ spawn) or leaves the cluster (→ evict).
 	seenEmpty map[guestID]struct{}
-	wg        sync.WaitGroup
+	// lastMeta: the guestMeta value used when we last spawned (or last
+	// re-spawned after a rename) a goroutine for this gid. pollGuest
+	// captures its fqdn at spawn time and never looks at lastMeta; this
+	// map exists solely so reconcile can detect "same gid, new name"
+	// and respawn. Invariant: a gid is in lastMeta iff it is in cancels.
+	lastMeta map[guestID]guestMeta
+	wg       sync.WaitGroup
 	// done is closed when Run returns. Stop() blocks on this so the
 	// OnShutdown hook doesn't return while the supervisor goroutine (and
 	// any in-flight per-guest goroutines it owns) are still reachable —
@@ -89,6 +95,7 @@ func newSupervisor(client pveapi.Client, st *store, zones []string,
 		pollKnown:      pollKnown,
 		cancels:        make(map[guestID]context.CancelFunc),
 		seenEmpty:      make(map[guestID]struct{}),
+		lastMeta:       make(map[guestID]guestMeta),
 		done:           make(chan struct{}),
 	}
 }
@@ -184,6 +191,7 @@ func (s *supervisor) reconcile(ctx context.Context) {
 		if _, ok := currentSet[gid]; !ok {
 			cancel()
 			delete(s.cancels, gid)
+			delete(s.lastMeta, gid)
 			s.store.Delete(gid)
 			log.Infof("guest %s/%d on %s gone — goroutine cancelled, record evicted",
 				gid.Type, gid.VMID, gid.Node)
@@ -195,6 +203,32 @@ func (s *supervisor) reconcile(ctx context.Context) {
 		if _, ok := currentSet[gid]; !ok {
 			delete(s.seenEmpty, gid)
 		}
+	}
+
+	// Rename detection: pollGuest captures its FQDN at spawn time and never
+	// looks at meta again — so if the operator renames a guest (same VMID,
+	// different Name), the running goroutine keeps upserting under the old
+	// FQDN and the new name never appears in DNS. Detect here by diffing
+	// currentSet against lastMeta; on mismatch, cancel + drop the old
+	// store record + clear bookkeeping so the spawn loop below re-spawns
+	// with the new meta. store.Delete races minimally against the old
+	// goroutine's in-flight poll (a stale Upsert can land in the ≤1s
+	// between cancel and its next select), but the new goroutine's first
+	// successful Upsert overwrites it.
+	for gid, g := range currentSet {
+		prev, tracked := s.lastMeta[gid]
+		if !tracked || prev.Name == g.Name {
+			continue
+		}
+		if cancel, ok := s.cancels[gid]; ok {
+			cancel()
+			delete(s.cancels, gid)
+		}
+		delete(s.lastMeta, gid)
+		delete(s.seenEmpty, gid)
+		s.store.Delete(gid)
+		log.Infof("guest %s/%d on %s renamed %q → %q — respawning",
+			gid.Type, gid.VMID, gid.Node, prev.Name, g.Name)
 	}
 
 	// Spawn: new or restarted guests.
@@ -220,6 +254,7 @@ func (s *supervisor) reconcile(ctx context.Context) {
 		}
 		gctx, gcancel := context.WithCancel(ctx)
 		s.cancels[gid] = gcancel
+		s.lastMeta[gid] = g
 		s.wg.Add(1)
 		go s.pollGuest(gctx, g)
 		log.Infof("tracking guest %s/%d on %s (%q)", gid.Type, gid.VMID, gid.Node, g.Name)

@@ -48,6 +48,7 @@ func parse(c *caddy.Controller) (*Proxmox, error) {
 		tokenSecretFile string
 		allowCIDRs      []netip.Prefix
 		excludeIPs      []netip.Addr
+		sriovStatePath  string
 		reconcileEvery  = 60 * time.Second
 		pollNever       = 60 * time.Second
 		pollKnown       = 5 * time.Minute
@@ -115,6 +116,11 @@ func parse(c *caddy.Controller) (*Proxmox, error) {
 					}
 					excludeIPs = append(excludeIPs, addr.Unmap())
 				}
+			case "sriov_state":
+				if !c.NextArg() {
+					return nil, c.ArgErr()
+				}
+				sriovStatePath = c.Val()
 			case "refresh":
 				// Back-compat alias for reconcile_every: old Corefiles may
 				// still set `refresh`. New three-knob form is preferred.
@@ -215,6 +221,7 @@ func parse(c *caddy.Controller) (*Proxmox, error) {
 		PollKnown:      pollKnown,
 		AllowCIDRs:     allowCIDRs,
 		ExcludeIPs:     excludeIPs,
+		SriovStatePath: sriovStatePath,
 		Fallthrough:    fall,
 		client:         client,
 	}, nil

@@ -141,6 +141,25 @@ The MAC is identified by regex-matching MAC-shaped values, not by
 hardcoding model names — so future PVE releases that introduce new NIC
 model keys work without a plugin change.
 
+**Why MAC, not interface name / bridge / IP?** MAC is the only identifier
+both sides agree on. The CT config's `name=eth0` is the veth's host-side
+name (the in-guest kernel calls it `ens18` / `enp6s18` / whatever systemd
+picks); VM configs have no in-guest name field at all. `bridge=` is a
+host-only concept. IPs are what we're trying to learn. MAC is written
+into the emulated NIC at launch and round-trips back through qemu-agent
+/ lxc `/interfaces` verbatim — it's the only field that matches between
+the PVE-config view and the guest-report view.
+
+**Is the MAC guaranteed to be there?** The PVE net0 schema makes MAC
+syntactically optional (`<model>[=<mac>]` for VMs, `hwaddr=<mac>` as one
+of many CT keys), but PVE auto-generates one and writes it back on every
+normal creation path — web UI, `qm/pct create`, API. A net0 config with
+no MAC only happens via hand-edited files that never see a lifecycle
+op after, which in practice doesn't occur. If it does, the channel
+softly declines to cover that guest (parseNet0 returns no MAC →
+`Claims` returns false) and other channels / the strict-allow-list
+default take over — no crash, no flicker.
+
 The channel's cache is refreshed once per `reconcile_every` tick: a
 per-guest config fetch updates the cached MAC, and guests that
 disappeared from the cluster list are evicted. A transient per-guest

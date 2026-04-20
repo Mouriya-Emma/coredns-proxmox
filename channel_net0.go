@@ -31,6 +31,29 @@ import (
 // We pick the MAC out by regex-matching MAC-shaped values rather than
 // hardcoding model names — forward-compatible with any future NIC model
 // PVE adds.
+//
+// Why MAC, not interface name / bridge / IP: MAC is the only identifier
+// both the PVE config side and the guest-report side (qemu-agent /
+// lxc /interfaces) name consistently. In-guest interface naming is
+// decided by the guest kernel + systemd (eth0 / ens18 / enp6s18 /
+// whatever) and doesn't match the CT config's `name=eth0` which is the
+// veth's host-side name; VM configs have no in-guest name field at all.
+// `bridge=` is a host concept the guest never sees. IPs are what we're
+// trying to learn. MAC is written into the VM's emulated NIC / the CT's
+// veth guest-end at launch and round-trips back through the agent
+// verbatim.
+//
+// MAC presence: the PVE net0 schema makes MAC syntactically optional
+// (`<model>[=<mac>]` for VMs, `hwaddr=<mac>` as one of many keys for
+// CTs), but every normal creation path — web UI, `qm/pct create`, API —
+// auto-generates a MAC and writes it back on create. A net0 config
+// without a MAC can only come from hand-editing the config file and
+// never triggering a lifecycle operation after; in practice it doesn't
+// happen. If it does, parseNet0 returns ("", false), refreshOne clears
+// the cache entry, and Claims returns false for that guest — the
+// channel simply doesn't cover it. Other channels (sriov, permissive)
+// still apply; a guest no channel covers drops from DNS, consistent
+// with the v0.1.5 strict-allow-list default.
 type net0Channel struct {
 	client pveapi.Client
 

@@ -46,7 +46,11 @@ type supervisor struct {
 
 	allowCIDRs []netip.Prefix
 	excludeIPs []netip.Addr
-	sriov      *sriovState // may be nil (no sriov_state configured)
+
+	// channels decide which interfaces of a guest contribute IPs. Strict
+	// allow-list: an interface contributes only if at least one channel
+	// claims it. See channel.go.
+	channels []Channel
 
 	enumerateEvery time.Duration // cluster-list reconcile cadence
 	pollNever      time.Duration // per-guest cadence while no IPs yet
@@ -58,7 +62,7 @@ type supervisor struct {
 }
 
 func newSupervisor(client pveapi.Client, st *store, zones []string,
-	allow []netip.Prefix, exclude []netip.Addr, sriov *sriovState,
+	allow []netip.Prefix, exclude []netip.Addr, channels []Channel,
 	enumerateEvery, pollNever, pollKnown time.Duration) *supervisor {
 	return &supervisor{
 		client:         client,
@@ -66,7 +70,7 @@ func newSupervisor(client pveapi.Client, st *store, zones []string,
 		zones:          zones,
 		allowCIDRs:     allow,
 		excludeIPs:     exclude,
-		sriov:          sriov,
+		channels:       channels,
 		enumerateEvery: enumerateEvery,
 		pollNever:      pollNever,
 		pollKnown:      pollKnown,
@@ -130,11 +134,13 @@ func (g guestMeta) fqdn(zones []string) string {
 // transiently-unreachable node. Existing goroutines keep running with
 // their last-known state.
 func (s *supervisor) reconcile(ctx context.Context) {
-	// Refresh the on-disk SR-IOV state once per reconcile cycle. Per-guest
-	// goroutines read from the same cache — keeps disk / parse work to one
-	// call per tick rather than once per guest.
-	if s.sriov != nil {
-		s.sriov.refresh()
+	// Give every channel a chance to refresh its cached state before the
+	// per-guest goroutines poll. Failures are non-fatal — a channel with
+	// stale data just keeps its last good view.
+	for _, ch := range s.channels {
+		if err := ch.OnReconcile(ctx); err != nil {
+			log.Warningf("channel %s reconcile refresh failed: %v", ch.Name(), err)
+		}
 	}
 
 	meta, err := s.enumerate(ctx)
@@ -235,11 +241,7 @@ func (s *supervisor) pollGuest(ctx context.Context, g guestMeta) {
 
 	hasSucceeded := false
 	for {
-		// Re-resolve expected MACs every poll — the supervisor refreshes
-		// the SR-IOV cache each reconcile tick (60s), so this is a cheap
-		// map lookup that reflects any new VF assignment since last poll.
-		expectedMacs, _ := s.sriov.lookup(g.ID.VMID)
-		ips, err := s.fetchGuestIPs(ctx, g.ID, expectedMacs)
+		ips, err := s.fetchGuestIPs(ctx, g.ID)
 		switch {
 		case err != nil:
 			log.Debugf("fetch IPs %s/%d on %s: %v — keeping last record", g.ID.Type, g.ID.VMID, g.ID.Node, err)
@@ -271,99 +273,72 @@ func (s *supervisor) pollGuest(ctx context.Context, g guestMeta) {
 	}
 }
 
-// fetchGuestIPs returns the LAN IPs attributed to a guest.
-//
-// When expectedMacs is non-empty, interfaces are pre-filtered by MAC match
-// — we keep IPs only from interfaces whose hardware-address is in the set.
-// This is the SR-IOV fast-path: the admin MACs come from `sriov dump`, and
-// matching on them is exact (docker / podman / netbird can't accidentally
-// match since they have different MACs even if they share the LAN CIDR).
-//
-// When expectedMacs is empty (guest not in sriov state, or sriov_state not
-// configured), we fall back to name-prefix heuristics to drop obvious
-// noise interfaces and rely on allow_cidr / exclude_ip for the rest.
-//
-// allow_cidr / exclude_ip always applies on top — it lets the operator
-// drop IPs they know are wrong even when the interface "looks" right.
-func (s *supervisor) fetchGuestIPs(ctx context.Context, gid guestID, expectedMacs []string) ([]net.IP, error) {
+// fetchGuestIPs returns the LAN IPs attributed to a guest. Interfaces are
+// gathered from the appropriate PVE API endpoint, normalised into a shared
+// InterfaceInfo shape, then filtered through the channel list (strict
+// allow-list: keep only if some channel claims the interface). Remaining
+// IPs pass through allow_cidr / exclude_ip as a final address-level trim.
+func (s *supervisor) fetchGuestIPs(ctx context.Context, gid guestID) ([]net.IP, error) {
 	rc, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
+	ifaces, err := s.collectInterfaces(rc, gid)
+	if err != nil {
+		return nil, err
+	}
+	var ips []net.IP
+	for _, iface := range ifaces {
+		if !claimsAny(s.channels, gid, iface) {
+			continue
+		}
+		ips = append(ips, iface.IPs...)
+	}
+	return filterIPs(ips, s.allowCIDRs, s.excludeIPs), nil
+}
+
+// collectInterfaces normalises qemu-agent / lxc-interfaces responses into a
+// shared InterfaceInfo list. Keeps the dispatch localised here so channels
+// never touch pveapi types.
+func (s *supervisor) collectInterfaces(ctx context.Context, gid guestID) ([]InterfaceInfo, error) {
 	switch gid.Type {
 	case "lxc":
-		return s.fetchLXCIPs(rc, gid, expectedMacs)
+		ifs, err := s.client.GetLXCInterfaces(ctx, gid.Node, gid.VMID)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]InterfaceInfo, 0, len(ifs))
+		for _, ifc := range ifs {
+			var ips []net.IP
+			for _, raw := range []string{ifc.Inet, ifc.Inet6} {
+				ips = appendParsed(ips, raw)
+			}
+			out = append(out, InterfaceInfo{
+				Name: ifc.Name,
+				Mac:  strings.ToLower(strings.TrimSpace(ifc.HardwareAddress)),
+				IPs:  ips,
+			})
+		}
+		return out, nil
 	case "qemu":
-		return s.fetchQEMUIPs(rc, gid, expectedMacs)
+		resp, err := s.client.GetQEMUInterfaces(ctx, gid.Node, gid.VMID)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]InterfaceInfo, 0, len(resp.Result))
+		for _, ifc := range resp.Result {
+			var ips []net.IP
+			for _, a := range ifc.IPAddresses {
+				ips = appendParsed(ips, a.Address)
+			}
+			out = append(out, InterfaceInfo{
+				Name: ifc.Name,
+				Mac:  strings.ToLower(strings.TrimSpace(ifc.HardwareAddress)),
+				IPs:  ips,
+			})
+		}
+		return out, nil
 	default:
 		return nil, fmt.Errorf("unknown guest type: %s", gid.Type)
 	}
-}
-
-func (s *supervisor) fetchLXCIPs(ctx context.Context, gid guestID, expectedMacs []string) ([]net.IP, error) {
-	ifs, err := s.client.GetLXCInterfaces(ctx, gid.Node, gid.VMID)
-	if err != nil {
-		return nil, err
-	}
-	var ips []net.IP
-	for _, ifc := range ifs {
-		if !keepInterface(ifc.Name, ifc.HardwareAddress, expectedMacs) {
-			continue
-		}
-		for _, raw := range []string{ifc.Inet, ifc.Inet6} {
-			ips = appendParsed(ips, raw)
-		}
-	}
-	return filterIPs(ips, s.allowCIDRs, s.excludeIPs), nil
-}
-
-func (s *supervisor) fetchQEMUIPs(ctx context.Context, gid guestID, expectedMacs []string) ([]net.IP, error) {
-	resp, err := s.client.GetQEMUInterfaces(ctx, gid.Node, gid.VMID)
-	if err != nil {
-		return nil, err
-	}
-	var ips []net.IP
-	for _, ifc := range resp.Result {
-		if !keepInterface(ifc.Name, ifc.HardwareAddress, expectedMacs) {
-			continue
-		}
-		for _, a := range ifc.IPAddresses {
-			ips = appendParsed(ips, a.Address)
-		}
-	}
-	return filterIPs(ips, s.allowCIDRs, s.excludeIPs), nil
-}
-
-// keepInterface decides whether a given guest interface contributes IPs.
-//
-// SR-IOV MAC matching is *additive*, not exclusive. A guest may legitimately
-// carry service IPs on several paths — an SR-IOV VF, net0 on a vmbr bridge,
-// or other NIC — and service discovery should surface all of them. Earlier
-// versions gated solely on MAC when sriov_state was available, which silently
-// dropped net0-on-vmbr interfaces even though they were legitimate service
-// addresses.
-//
-// Decision:
-//   - MAC match against expectedMacs → authoritative keep. The SR-IOV VF is
-//     guaranteed to be the right interface, regardless of name (defensive
-//     against unusual ifname patterns).
-//   - Otherwise → name heuristic. Drop known-noise prefixes (docker, br-<hash>,
-//     veth, cni-, wt0 for netbird) and lo. Keep everything else, including
-//     generic ethN / enpNsN / net0.
-//
-// allow_cidr + exclude_ip still run after this on the IPs themselves, so an
-// operator can trim whatever slips through at the address level.
-func keepInterface(name, hwaddr string, expectedMacs []string) bool {
-	if len(expectedMacs) > 0 && macInSet(hwaddr, expectedMacs) {
-		return true
-	}
-	if name == "lo" ||
-		strings.HasPrefix(name, "docker") ||
-		strings.HasPrefix(name, "br-") ||
-		strings.HasPrefix(name, "veth") ||
-		strings.HasPrefix(name, "cni-") ||
-		name == "wt0" {
-		return false
-	}
-	return true
 }
 
 // withJitter spreads a base interval by ±frac (0.1 = ±10%). Prevents every

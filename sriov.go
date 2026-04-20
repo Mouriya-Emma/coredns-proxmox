@@ -87,9 +87,13 @@ func (s *sriovState) recordErr(err error) {
 
 // lookup returns the set of expected MACs for a vmid, or (nil, false) if
 // this vmid doesn't appear in the state (guest not using SR-IOV, or state
-// file not loaded).
+// file not loaded yet).
+//
+// Does not gate on path — the state map is the source of truth. refresh()
+// is the no-op when path is empty; lookup just answers from whatever's
+// currently loaded, which may be test-injected.
 func (s *sriovState) lookup(vmid int) ([]string, bool) {
-	if s == nil || s.path == "" {
+	if s == nil {
 		return nil, false
 	}
 	s.mu.RLock()

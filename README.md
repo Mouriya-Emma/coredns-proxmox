@@ -22,7 +22,9 @@ hb.lan:5300 {
         token_secret_file /etc/coredns/pve-token
         allow_cidr 192.168.1.0/24
         exclude_ip 192.168.1.22 192.168.1.67
-        refresh 60s
+        reconcile_every 60s
+        poll_never_ips 60s
+        poll_known_ips 5m
         ttl 60
         fallthrough
     }
@@ -47,9 +49,39 @@ Directive reference:
 | `allow_cidr` | no | one or more CIDRs; if any given, only IPs in one of these CIDRs are returned. Repeatable; multiple values on one line allowed |
 | `exclude_ip` | no | drop these specific IPs from every emitted record. Use for IPs already claimed by a static source (e.g. authoritative host file, hypervisor secondary NICs). Repeatable; multiple values on one line allowed |
 | `insecure_skip_verify` | no | accept self-signed PVE certs |
-| `refresh` | no | inventory refresh interval (default `60s`) |
+| `reconcile_every` | no | how often the supervisor re-enumerates the cluster to spawn/cancel per-guest goroutines. Default `60s`. `refresh` is accepted as a back-compat alias |
+| `poll_never_ips` | no | per-guest poll cadence *until that guest first returns IPs*. Default `60s` — keep this short so slow-booting VMs show up in DNS soon after agent becomes responsive |
+| `poll_known_ips` | no | per-guest poll cadence *after* first success. Default `5m` — long enough to avoid hammering PVE, short enough to catch an IP change within minutes |
 | `ttl` | no | A/AAAA record TTL (default `60`) |
 | `fallthrough` | no | on no-match, hand off to the next plugin in the chain |
+
+## Cold-start + slow-boot design
+
+Each PVE guest gets its own discovery goroutine. Why:
+
+- A VM can take minutes from power-on to qemu-agent responding. If discovery
+  ran as a single "refresh the whole cluster every N seconds" loop, a
+  still-booting VM would be repeatedly absent from the records map, and a
+  transient agent failure on any one guest would evict its record even
+  though we had a fresh answer seconds ago.
+- With per-guest goroutines, each guest progresses on its own schedule.
+  Fast-boot LXCs populate immediately; slow-boot VMs appear when their
+  agent catches up. Nothing blocks anything else.
+
+Cadence is two-level:
+
+- `poll_never_ips` (aggressive, default 60s) runs until the guest first
+  returns usable IPs. This is the "still warming up" poll — we want DNS
+  to start resolving the guest as soon as it's ready.
+- `poll_known_ips` (relaxed, default 5m) takes over after the first
+  success. The only reason to keep polling is to catch an IP change, so
+  this can be slow. A per-poll jitter of ±10% prevents all goroutines
+  from synchronising.
+
+Records for a given guest are only *evicted* when the cluster-list
+enumeration confirms the guest is gone (destroyed) or no longer running
+(stopped/paused). A failed agent call — or agent returning empty IPs —
+never evicts; it just means "try again next tick."
 
 Plugin chain order matters: place `proxmox` **before** `hosts` in the Corefile
 and in `plugin.cfg` so PVE-authoritative names win over scanner-derived entries

@@ -1,6 +1,14 @@
 // Package proxmox is a CoreDNS plugin that answers A/AAAA queries for
 // Proxmox VM and LXC guest hostnames, resolving them via the Proxmox API.
 //
+// Architecture: a supervisor goroutine reconciles the cluster state every
+// reconcile_every (default 60s). For each running guest it spawns a
+// dedicated goroutine that polls that guest's IPs on its own schedule —
+// aggressively (poll_never_ips, default 60s) until it first succeeds, then
+// relaxed (poll_known_ips, default 5min) to pick up IP changes. This keeps
+// slow-booting VMs from blocking anything else, and prevents transient
+// agent-not-responding errors from evicting good records.
+//
 // Key features:
 //   - LXC discovery via /lxc/<id>/interfaces (no qemu-agent required)
 //   - QEMU discovery via /qemu/<id>/agent/network-get-interfaces
@@ -10,10 +18,8 @@ package proxmox
 
 import (
 	"context"
-	"net"
 	"net/netip"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/coredns/coredns/plugin"
@@ -31,15 +37,24 @@ var log = clog.NewWithPlugin("proxmox")
 type Proxmox struct {
 	Next plugin.Handler
 
-	// Zones this plugin is authoritative-ish for (derived from server block keys).
-	// Names are normalised lowercase with no trailing dot.
+	// Zones this plugin is authoritative-ish for. Lowercase, trailing dot.
 	Zones []string
 
 	// TTL for emitted A/AAAA records.
 	TTL uint32
 
-	// Refresh interval for the PVE inventory loop.
-	Refresh time.Duration
+	// ReconcileEvery controls the cluster-list sync cadence.
+	ReconcileEvery time.Duration
+
+	// PollNever is the per-guest poll interval until the first successful
+	// IP acquisition. Short — we want boot-time records to appear fast.
+	PollNever time.Duration
+
+	// PollKnown is the per-guest poll interval once we've seen IPs at least
+	// once. Long — most of the time IPs don't change; this just catches
+	// the cases where they do (DHCP renew with different lease, manual
+	// reconfigure, etc.).
+	PollKnown time.Duration
 
 	// AllowCIDRs, if non-empty, keeps only IPs in one of these prefixes.
 	AllowCIDRs []netip.Prefix
@@ -53,13 +68,10 @@ type Proxmox struct {
 	Fallthrough bool
 
 	client pveapi.Client
+	store  *store
+	sup    *supervisor
 	cancel context.CancelFunc
-
-	// records holds the current name→IPs map. Swapped atomically on refresh.
-	records atomic.Pointer[recordSet]
 }
-
-type recordSet map[string][]net.IP
 
 func (p *Proxmox) Name() string { return "proxmox" }
 
@@ -71,13 +83,8 @@ func (p *Proxmox) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg
 		return plugin.NextOrFailure(p.Name(), p.Next, ctx, w, r)
 	}
 
-	records := p.records.Load()
-	if records == nil {
-		return p.miss(ctx, w, r)
-	}
-
-	ips, ok := (*records)[qname]
-	if !ok || len(ips) == 0 {
+	ips := p.store.Lookup(qname)
+	if len(ips) == 0 {
 		return p.miss(ctx, w, r)
 	}
 
@@ -123,3 +130,28 @@ func (p *Proxmox) miss(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (i
 	_ = w.WriteMsg(msg)
 	return dns.RcodeSuccess, nil
 }
+
+// Start wires up the store + supervisor and spawns the reconcile loop.
+// Returns immediately; the initial reconcile runs inside the supervisor
+// goroutine so the plugin can start even when PVE is unreachable.
+func (p *Proxmox) Start() error {
+	ctx, cancel := context.WithCancel(context.Background())
+	p.cancel = cancel
+	p.store = newStore()
+	p.sup = newSupervisor(p.client, p.store, p.Zones, p.AllowCIDRs, p.ExcludeIPs,
+		p.ReconcileEvery, p.PollNever, p.PollKnown)
+	go p.sup.Run(ctx)
+	return nil
+}
+
+// Stop cancels the supervisor and all per-guest goroutines, then waits for
+// them to return.
+func (p *Proxmox) Stop() error {
+	if p.cancel != nil {
+		p.cancel()
+	}
+	return nil
+}
+
+// Compile-time assertion: we satisfy the plugin.Handler interface.
+var _ plugin.Handler = (*Proxmox)(nil)
